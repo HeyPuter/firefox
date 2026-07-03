@@ -326,20 +326,6 @@ APZEventResult APZInputBridge::ReceiveInputEvent(
     }
     case eWheelEventClass: {
       WidgetWheelEvent& wheelEvent = *aEvent.AsWheelEvent();
-      {
-        Maybe<APZWheelAction> a = ActionForWheelEvent(&wheelEvent);
-        static int s_wa = 0;
-        if (s_wa < 8) {
-          s_wa++;
-          printf(
-              "APZ-DIAG InputBridge wheel: msg=%d deltaMode=%d dY=%.1f "
-              "action=%d\n",
-              (int)wheelEvent.mMessage, (int)wheelEvent.mDeltaMode,
-              (double)wheelEvent.mDeltaY,
-              a.isSome() ? (int)a.value() : -1);
-          fflush(stdout);
-        }
-      }
 
       if (Maybe<APZWheelAction> action = ActionForWheelEvent(&wheelEvent)) {
         ScrollWheelInput::ScrollMode scrollMode =

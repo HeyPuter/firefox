@@ -683,19 +683,6 @@ static bool PrepareForSetTargetAPZCNotification(
   nsIFrame* target = nsLayoutUtils::GetFrameForPoint(relativeTo, point);
   ScrollContainerFrame* scrollAncestor =
       GetScrollContainerFor(target, aRootFrame);
-  {
-    static int s_prep = 0;
-    if (s_prep < 20) {
-      s_prep++;
-      printf("APZ-TGT prepare: target=%p scrollAncestor=%p isRoot=%d\n",
-             (void*)target, (void*)scrollAncestor,
-             scrollAncestor ? (int)(scrollAncestor ==
-                                    aRootFrame->PresShell()
-                                        ->GetRootScrollContainerFrame())
-                            : -1);
-      fflush(stdout);
-    }
-  }
 
   // Assuming that if there's no scrollAncestor, there's already a displayPort.
   nsCOMPtr<dom::Element> dpElement =
@@ -829,20 +816,6 @@ APZCCallbackHelper::SendSetTargetAPZCNotification(nsIWidget* aWidget,
                                                   const WidgetGUIEvent& aEvent,
                                                   const LayersId& aLayersId,
                                                   uint64_t aInputBlockId) {
-  {
-    static int s_sstg = 0;
-    if (s_sstg < 20) {
-      s_sstg++;
-      PresShell* ps = aDocument ? aDocument->GetPresShell() : nullptr;
-      printf(
-          "APZ-TGT send: widget=%d doc=%d presShell=%d inputBlock=%llu "
-          "sLast=%llu\n",
-          (int)!!aWidget, (int)!!aDocument, (int)!!ps,
-          (unsigned long long)aInputBlockId,
-          (unsigned long long)sLastTargetAPZCNotificationInputBlock);
-      fflush(stdout);
-    }
-  }
   if (!aWidget || !aDocument) {
     return nullptr;
   }

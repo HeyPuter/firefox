@@ -892,17 +892,8 @@ void RenderThread::UpdateAndRender(
     // and for avoiding GPU queue is filled with too much tasks.
     // WaitForGPU's implementation is different for each platform.
     auto timerId = glean::wr::gpu_wait_time.Start();
-    TimeStamp gpuS = TimeStamp::Now();
     renderer->WaitForGPU();
-    double gpuWaitMs = (TimeStamp::Now() - gpuS).ToMilliseconds();
     glean::wr::gpu_wait_time.StopAndAccumulate(std::move(timerId));
-    static int s_renderDiag = 0;
-    if (s_renderDiag < 40) {
-      s_renderDiag++;
-      printf("RENDER-DIAG renderCPU=%.1fms gpuWait=%.1fms\n",
-             (end - start).ToMilliseconds(), gpuWaitMs);
-      fflush(stdout);
-    }
   } else {
     // Update frame id for NotifyPipelinesUpdated() when rendering does not
     // happen, either because rendering was not requested or the frame was

@@ -271,9 +271,6 @@ void CompositorBridgeParent::Initialize() {
     mApzcTreeManager = APZCTreeManager::Create(mRootLayerTreeID);
     mApzSampler = new APZSampler(mApzcTreeManager, true);
     mApzUpdater = new APZUpdater(mApzcTreeManager, true);
-    printf("APZ-INIT: CompositorBridgeParent created APZCTreeManager (UseAPZ=1)\n");
-  } else {
-    printf("APZ-INIT: UseAPZ=0 (no APZCTreeManager)\n");
   }
 
   CompositorAnimationStorage* animationStorage = GetAnimationStorage();

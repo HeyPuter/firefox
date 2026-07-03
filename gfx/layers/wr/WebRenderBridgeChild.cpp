@@ -135,21 +135,6 @@ bool WebRenderBridgeChild::EndTransaction(
   MOZ_ASSERT(mIsInTransaction);
 
   TimeStamp fwdTime = TimeStamp::Now();
-  {
-    static TimeStamp s_lastEnd;
-    static int s_etDiag = 0;
-    if (s_etDiag < 40) {
-      s_etDiag++;
-      double intervalMs =
-          s_lastEnd.IsNull() ? 0.0 : (fwdTime - s_lastEnd).ToMilliseconds();
-      double paintMs = aTxnStartTime.IsNull()
-                           ? 0.0
-                           : (fwdTime - aTxnStartTime).ToMilliseconds();
-      printf("ET-DIAG mainPaintMs=%.1f intervalMs=%.1f\n", paintMs, intervalMs);
-      fflush(stdout);
-    }
-    s_lastEnd = fwdTime;
-  }
 
   if (!aRenderOffscreen) {
     MergeWebRenderParentCommands();

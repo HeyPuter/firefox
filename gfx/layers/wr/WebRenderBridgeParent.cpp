@@ -1559,15 +1559,6 @@ bool WebRenderBridgeParent::ProcessDisplayListData(
   // Note that this needs to happen before the display list transaction is
   // sent to WebRender, so that the UpdateHitTestingTree call is guaranteed to
   // be in the updater queue at the time that the scene swap completes.
-  {
-    static int s_sdLog = 0;
-    if (s_sdLog < 5) {
-      s_sdLog++;
-      printf("APZ-DIAG WRBP::SetDisplayList scrollData=%d\n",
-             (int)(bool)aDisplayList.mScrollData);
-      fflush(stdout);
-    }
-  }
   if (aDisplayList.mScrollData) {
     UpdateAPZScrollData(aWrEpoch, std::move(aDisplayList.mScrollData.ref()));
   }

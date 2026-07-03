@@ -3048,18 +3048,6 @@ void nsLayoutUtils::PaintFrame(gfxContext* aRenderingContext, nsIFrame* aFrame,
     (void)rootScrollContainerFrame->DecideScrollableLayer(
         builder, &displayPortBase, &temp,
         /* aSetBase = */ true);
-    static int s_dpRoot = 0;
-    if (s_dpRoot < 6) {
-      s_dpRoot++;
-      printf(
-          "APZ-DIAG root paint: paintingToWindow=%d apzEnabled=%d "
-          "rootHasDisplayPort=%d\n",
-          (int)builder->IsPaintingToWindow(),
-          (int)nsLayoutUtils::AsyncPanZoomEnabled(aFrame),
-          (int)DisplayPortUtils::HasDisplayPort(
-              rootScrollContainerFrame->GetContent()));
-      fflush(stdout);
-    }
   }
 
   // In the case where we use APZ for the given popup frame, we need to set the

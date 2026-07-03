@@ -741,15 +741,6 @@ std::vector<LayersId> APZCTreeManager::UpdateHitTestingTree(
     // APZC instances
     MutexAutoLock lock(mMapLock);
     mApzcMap = std::move(state.mApzcMap);
-    {
-      static int s_apzcLog = 0;
-      if (s_apzcLog < 6) {
-        s_apzcLog++;
-        printf("APZ-DIAG UpdateHitTestingTree: APZC count=%zu\n",
-               mApzcMap.size());
-        fflush(stdout);
-      }
-    }
 
     for (auto& mapping : mApzcMap) {
       AsyncPanZoomController* parent = mapping.second.apzc->GetParent();
@@ -1720,19 +1711,6 @@ APZEventResult APZCTreeManager::ReceiveInputEvent(
       state.mHit = GetTargetAPZC(wheelInput.mOrigin);
 
       wheelInput.mHandledByAPZ = WillHandleInput(wheelInput);
-      {
-        static int s_wlog = 0;
-        if (s_wlog < 8) {
-          s_wlog++;
-          printf(
-              "APZ-DIAG wheel hit: origin=(%.1f,%.1f) handledByAPZ=%d "
-              "targetApzc=%p\n",
-              (double)wheelInput.mOrigin.x, (double)wheelInput.mOrigin.y,
-              (int)wheelInput.mHandledByAPZ,
-              (void*)state.mHit.mTargetApzc.get());
-          fflush(stdout);
-        }
-      }
       if (!wheelInput.mHandledByAPZ) {
         return state.Finish(*this, std::move(aCallback));
       }

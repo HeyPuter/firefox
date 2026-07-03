@@ -1108,20 +1108,6 @@ nsEventStatus nsIWidget::ProcessUntransformedAPZEvent(
   UniquePtr<WidgetEvent> original(aEvent->Duplicate());
   nsEventStatus status = DispatchEvent(aEvent);
 
-  if (aEvent->AsWheelEvent()) {
-    static int s_tgt = 0;
-    if (s_tgt < 20) {
-      s_tgt++;
-      printf(
-          "APZ-TGT: mAPZC=%d routed=%d dropped=%d inputBlockId=%llu "
-          "apzEventState=%d\n",
-          (int)!!mAPZC, (int)InputAPZContext::WasRoutedToChildProcess(),
-          (int)InputAPZContext::WasDropped(),
-          (unsigned long long)inputBlockId, (int)!!mAPZEventState);
-      fflush(stdout);
-    }
-  }
-
   if (mAPZC && !InputAPZContext::WasRoutedToChildProcess() &&
       !InputAPZContext::WasDropped() && inputBlockId) {
     // EventStateManager did not route the event into the child process and
