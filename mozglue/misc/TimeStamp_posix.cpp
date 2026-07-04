@@ -92,6 +92,28 @@ static uint64_t ClockTimeNs(const clockid_t aClockId = CLOCK_MONOTONIC) {
   return TimespecToNs(ts);
 }
 
+#if defined(__EMSCRIPTEN__)
+// Coarse-clock fast path (GECKO_COARSE_CLOCK): the embedder publishes a shared-heap
+// nanosecond clock (same timeline as clock_gettime(CLOCK_MONOTONIC)) refreshed ~1ms
+// by a main-thread writer, letting the low-res TimeStamp path skip the per-call
+// wasm->JS performance.now() crossing. Weak so a build without the embedder degrades
+// to the real clock. See gecko.js/src/embed-xul.cpp + lib/coarse-clock.js.
+extern "C" __attribute__((weak)) int gecko_coarse_clock_enabled();
+extern "C" __attribute__((weak)) int64_t* gecko_coarse_now_ptr();
+static inline uint64_t GeckoCoarseNowNs() {
+  if (!gecko_coarse_clock_enabled || !gecko_coarse_clock_enabled() ||
+      !gecko_coarse_now_ptr) {
+    return 0;
+  }
+  int64_t* p = gecko_coarse_now_ptr();
+  if (!p) {
+    return 0;
+  }
+  int64_t v = __atomic_load_n(p, __ATOMIC_RELAXED);
+  return v > 0 ? uint64_t(v) : 0;
+}
+#endif
+
 namespace mozilla {
 
 double BaseTimeDurationPlatformUtils::ToSeconds(int64_t aTicks) {
@@ -137,6 +159,22 @@ void TimeStamp::Startup() {
 void TimeStamp::Shutdown() {}
 
 TimeStamp TimeStamp::Now(bool aHighResolution) {
+#if defined(__EMSCRIPTEN__)
+  if (!aHighResolution) {
+    uint64_t coarse = GeckoCoarseNowNs();
+    if (coarse) {
+      // Per-thread clamp: the shared word can lag the real clock by up to the writer
+      // cadence, so guard against a backwards step within a thread.
+      static thread_local uint64_t sLastCoarse = 0;
+      if (coarse < sLastCoarse) {
+        coarse = sLastCoarse;
+      } else {
+        sLastCoarse = coarse;
+      }
+      return TimeStamp(coarse);
+    }
+  }
+#endif
 #ifdef CLOCK_MONOTONIC_COARSE
   if (!aHighResolution && sSupportsMonotonicCoarseClock) {
     return TimeStamp(ClockTimeNs(CLOCK_MONOTONIC_COARSE));

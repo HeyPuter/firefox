@@ -166,6 +166,15 @@ class imgFrame {
   const IntRect& GetDirtyRect() const { return mDirtyRect; }
   void SetDirtyRect(const IntRect& aDirtyRect) { mDirtyRect = aDirtyRect; }
 
+  // Host-GPU image passthrough: when nonzero, this frame's pixels live in a host-
+  // uploaded GL texture registered as a WebRender external image with this id, and
+  // DecodedSurfaceProvider::UpdateKey submits it as an external image instead of a
+  // CPU surface (no readback / texture-cache upload). 0 = ordinary CPU frame.
+  void SetHostGpuExternalImage(uint64_t aExternalId) {
+    mHostGpuExternalId = aExternalId;
+  }
+  uint64_t HostGpuExternalImage() const { return mHostGpuExternalId; }
+
   void FinalizeSurface();
   already_AddRefed<SourceSurface> GetSourceSurface();
 
@@ -249,6 +258,10 @@ class imgFrame {
 
   //! The size of the buffer we are decoding to.
   IntSize mImageSize;
+
+  //! Nonzero if this frame is backed by a host-uploaded GL texture exposed as a
+  //! WebRender external image with this id (host-GPU image passthrough).
+  uint64_t mHostGpuExternalId = 0;
 
   //! The contents for the frame, as represented in the encoded image. This may
   //! differ from mImageSize because it may be a partial frame. For the first

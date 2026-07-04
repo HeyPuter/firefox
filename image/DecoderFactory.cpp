@@ -26,11 +26,51 @@
 #  include "nsJXLDecoder.h"
 #endif
 
+#ifdef __EMSCRIPTEN__
+#  include <stdlib.h>
+#  include "nsHostProxyImageDecoder.h"
+#endif
+
 namespace mozilla {
 
 using namespace gfx;
 
 namespace image {
+
+#ifdef __EMSCRIPTEN__
+// Opt-in: route full single-frame image decode to the host browser's WebCodecs
+// ImageDecoder (see nsHostProxyImageDecoder). Read once from the environment.
+//   0 = off, 1 = CPU (copyTo + SurfacePipe), 2 = GPU (zero-copy WR external image)
+// GPU mode also requires WebRender (GECKO_GPU); otherwise it degrades to CPU.
+static int HostImageProxyMode() {
+  static const int sMode = [] {
+    const char* v = getenv("GECKO_IMG_PASSTHROUGH");
+    if (!v || !*v) {
+      return 0;
+    }
+    if (!strcmp(v, "gpu") && getenv("GECKO_GPU")) {
+      return 2;
+    }
+    return 1;
+  }();
+  return sMode;
+}
+
+// Types the host ImageDecoder can handle and that we proxy. GIF/BMP/ICO are left
+// to the native decoders (animation + embedded-subimage edge cases).
+static bool HostImageProxyableType(DecoderType aType) {
+  switch (aType) {
+    case DecoderType::PNG:
+    case DecoderType::JPEG:
+    case DecoderType::JPEG_PDF:
+    case DecoderType::WEBP:
+    case DecoderType::AVIF:
+      return true;
+    default:
+      return false;
+  }
+}
+#endif
 
 /* static */
 DecoderType DecoderFactory::GetDecoderType(const char* aMimeType) {
@@ -164,8 +204,18 @@ nsresult DecoderFactory::CreateDecoder(
 
   // Create an anonymous decoder. Interaction with the SurfaceCache and the
   // owning RasterImage will be mediated by DecodedSurfaceProvider.
-  RefPtr<Decoder> decoder = GetDecoder(
-      aType, nullptr, bool(aDecoderFlags & DecoderFlags::IS_REDECODE));
+  RefPtr<Decoder> decoder;
+#ifdef __EMSCRIPTEN__
+  int hostImgMode = HostImageProxyMode();
+  if (hostImgMode && HostImageProxyableType(aType)) {
+    decoder = new nsHostProxyImageDecoder(nullptr, aType,
+                                          /* aGpu */ hostImgMode == 2);
+  } else
+#endif
+  {
+    decoder = GetDecoder(aType, nullptr,
+                         bool(aDecoderFlags & DecoderFlags::IS_REDECODE));
+  }
   MOZ_ASSERT(decoder, "Should have a decoder now");
 
   // Initialize the decoder.

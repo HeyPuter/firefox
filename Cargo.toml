@@ -195,6 +195,35 @@ opt-level = 2
 [profile.release.package.glsl]
 opt-level = 2
 
+# wasm (emscripten) build: the engine ships JIT-less, so WebRender's frame/scene
+# build and Stylo restyle run as interpreted-free but unoptimized-across-functions
+# wasm and dominate render CPU. The build is DEVELOPER_OPTIONS=1 (no --enable-release),
+# so the global `-C codegen-units=1` is skipped (config/makefiles/rust.mk). Force it
+# per-crate for the hottest render/style crates: cgu=1 gives rustc whole-crate
+# inlining/monomorphization the stripped-wasm post-link wasm-opt can't reconstruct.
+# These are built under THIS root workspace (their fingerprints live in the gecko
+# objdir), so the override must live here, not in gfx/wr/Cargo.toml.
+[profile.release.package.webrender]
+codegen-units = 1
+
+[profile.release.package.webrender_api]
+codegen-units = 1
+
+[profile.release.package.swgl]
+codegen-units = 1
+
+[profile.release.package.style]
+codegen-units = 1
+
+[profile.release.package.selectors]
+codegen-units = 1
+
+[profile.release.package.euclid]
+codegen-units = 1
+
+[profile.release.package.qcms]
+codegen-units = 1
+
 # Megazord profiles: same as dev/release but with panic=unwind for parity with
 # how app-services is currently built.
 [profile.dev-megazord]

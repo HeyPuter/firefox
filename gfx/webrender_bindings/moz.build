@@ -18,6 +18,7 @@ EXPORTS.mozilla.webrender += [
     "RendererOGL.h",
     "RendererScreenshotGrabber.h",
     "RenderExternalTextureHost.h",
+    "RenderHostGpuTextureHost.h",
     "RenderSharedSurfaceTextureHost.h",
     "RenderTextureHost.h",
     "RenderTextureHostSWGL.h",
@@ -50,6 +51,13 @@ UNIFIED_SOURCES += [
     "WebRenderAPI.cpp",
     "WebRenderTypes.cpp",
 ]
+
+# Host-GPU image passthrough: external image backed by a host-uploaded GL texture
+# (EM_ASM into emscripten's GL.textures). Non-unified + emscripten-only.
+if CONFIG["OS_TARGET"] == "EMSCRIPTEN":
+    SOURCES += [
+        "RenderHostGpuTextureHost.cpp",
+    ]
 
 if CONFIG["MOZ_WIDGET_TOOLKIT"] in ("cocoa", "uikit"):
     EXPORTS.mozilla.webrender += [

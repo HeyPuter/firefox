@@ -20,6 +20,19 @@ mozilla::LazyLogModule gAudioSinkWrapperLog("AudioSinkWrapper");
 
 namespace mozilla {
 
+#ifdef __EMSCRIPTEN__
+extern "C" void hostaudio_set_playing(int aPlaying);
+extern "C" void hostaudio_set_media_time(double aMediaTimeSeconds);
+
+static bool IgnoreAudioSinkInitFailure(nsresult aRv) {
+  return aRv == NS_ERROR_DOM_MEDIA_CUBEB_INITIALIZATION_ERR;
+}
+
+static bool ShouldRetryAudioSinkInit(nsresult aRv) {
+  return !IgnoreAudioSinkInitFailure(aRv);
+}
+#endif
+
 using media::TimeUnit;
 
 AudioSinkWrapper::~AudioSinkWrapper() = default;
@@ -127,10 +140,12 @@ TimeUnit AudioSinkWrapper::GetPosition(TimeStamp* aTimeStamp) {
     }
     mLastClockSource = ClockSource::SystemClock;
 
+#ifndef __EMSCRIPTEN__
     if (!mAudioSink && mAsyncCreateCount == 0 && NeedAudioSink() &&
         t > mRetrySinkTime) {
       MaybeAsyncCreateAudioSink(mAudioDevice);
     }
+#endif
   } else {
     // Return how long we've played if we are not playing.
     pos = mPositionAtClockStart;
@@ -142,6 +157,10 @@ TimeUnit AudioSinkWrapper::GetPosition(TimeStamp* aTimeStamp) {
   if (aTimeStamp) {
     *aTimeStamp = t;
   }
+
+#ifdef __EMSCRIPTEN__
+  hostaudio_set_media_time(pos.ToSeconds());
+#endif
 
   return pos;
 }
@@ -258,6 +277,9 @@ void AudioSinkWrapper::SetPlaying(bool aPlaying) {
   AssertOwnerThread();
   LOG("{}: AudioSinkWrapper::SetPlaying {}", fmt::ptr(this),
       aPlaying ? "true" : "false");
+#ifdef __EMSCRIPTEN__
+  hostaudio_set_playing(aPlaying ? 1 : 0);
+#endif
 
   // Resume/pause matters only when playback started.
   if (!mIsStarted) {
@@ -308,6 +330,12 @@ nsresult AudioSinkWrapper::Start(const TimeUnit& aStartTime,
   mClockStartTime = TimeStamp::Now();
   mAudioEnded = IsAudioSourceEnded(aInfo);
   mLastPacketEndTime = TimeUnit::Zero();
+#ifdef __EMSCRIPTEN__
+  hostaudio_set_media_time(aStartTime.ToSeconds());
+  if (!mAudioEnded && !IsMuted()) {
+    hostaudio_set_playing(1);
+  }
+#endif
 
   if (mAudioEnded) {
     // Resolve promise if we start playback at the end position of the audio.
@@ -326,9 +354,13 @@ nsresult AudioSinkWrapper::Start(const TimeUnit& aStartTime,
 }
 
 bool AudioSinkWrapper::NeedAudioSink() {
+#ifdef __EMSCRIPTEN__
+  return false;
+#else
   // An AudioSink is needed if unmuted, playing, and not ended.  The not-ended
   // check also avoids creating an AudioSink when there is no audio track.
   return !IsMuted() && IsPlaying() && !mEndedPromiseHolder.IsEmpty();
+#endif
 }
 
 void AudioSinkWrapper::StartAudioSink(UniquePtr<AudioSink> aAudioSink,
@@ -392,12 +424,18 @@ RefPtr<GenericPromise> AudioSinkWrapper::MaybeAsyncCreateAudioSink(
                // the video would therefore not update. The Start() call
                // is very cheap on the other hand, we can do it from the
                // MDSM thread.
-               nsresult rv = audioSink->InitializeAudioStream(
-                   audioDevice, AudioSink::InitializationType::UNMUTING);
-               if (NS_FAILED(rv)) {
-                 LOG("Async AudioSink initialization failed");
-                 return Promise::CreateAndReject(rv, __func__);
-               }
+                nsresult rv = audioSink->InitializeAudioStream(
+                    audioDevice, AudioSink::InitializationType::UNMUTING);
+                if (NS_FAILED(rv)) {
+#ifdef __EMSCRIPTEN__
+                  if (IgnoreAudioSinkInitFailure(rv)) {
+                    LOG("Async AudioSink initialization failed; continuing without AudioStream in wasm host-audio mode");
+                    return Promise::CreateAndResolve(nullptr, __func__);
+                  }
+#endif
+                  LOG("Async AudioSink initialization failed");
+                  return Promise::CreateAndReject(rv, __func__);
+                }
                return Promise::CreateAndResolve(std::move(audioSink), __func__);
              })
       ->Then(
@@ -436,7 +474,13 @@ RefPtr<GenericPromise> AudioSinkWrapper::MaybeAsyncCreateAudioSink(
             if (aValue.IsReject()) {
               if (audioDevice) {
                 // Device will be started when available again.
+#ifdef __EMSCRIPTEN__
+                if (ShouldRetryAudioSinkInit(aValue.RejectValue())) {
+                  ScheduleRetrySink();
+                }
+#else
                 ScheduleRetrySink();
+#endif
               } else {
                 // Default device not available.  Report error.
                 MOZ_ASSERT(!mAudioSink);
@@ -481,11 +525,23 @@ nsresult AudioSinkWrapper::SyncCreateAudioSink(const TimeUnit& aStartTime) {
   nsresult rv = audioSink->InitializeAudioStream(
       mAudioDevice, AudioSink::InitializationType::INITIAL);
   if (NS_FAILED(rv)) {
+#ifdef __EMSCRIPTEN__
+    if (IgnoreAudioSinkInitFailure(rv)) {
+      LOG("Sync AudioSinkWrapper initialization failed; continuing without AudioStream in wasm host-audio mode");
+      return NS_OK;
+    }
+#endif
     LOG("Sync AudioSinkWrapper initialization failed");
     // If a specific device has been specified through setSinkId()
     // the sink is started after the device becomes available again.
     if (mAudioDevice) {
+#ifdef __EMSCRIPTEN__
+      if (ShouldRetryAudioSinkInit(rv)) {
+        ScheduleRetrySink();
+      }
+#else
       ScheduleRetrySink();
+#endif
       return NS_OK;
     }
     // If a default output device is not available, the system may not support
@@ -517,6 +573,9 @@ void AudioSinkWrapper::Stop() {
   MOZ_ASSERT(mIsStarted, "playback not started.");
 
   LOG("{}: AudioSinkWrapper::Stop", fmt::ptr(this));
+#ifdef __EMSCRIPTEN__
+  hostaudio_set_playing(0);
+#endif
 
   mIsStarted = false;
   mClockStartTime = TimeStamp();

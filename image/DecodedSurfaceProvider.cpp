@@ -7,8 +7,16 @@
 #include "mozilla/StaticPrefs_image.h"
 #include "mozilla/layers/SharedSurfacesChild.h"
 #include "nsProxyRelease.h"
+#ifdef __EMSCRIPTEN__
+#  include "mozilla/layers/RenderRootStateManager.h"
+#  include "mozilla/layers/WebRenderBridgeChild.h"
+#  include "mozilla/layers/IpcResourceUpdateQueue.h"
+#  include "mozilla/webrender/RenderThread.h"
+#  include "mozilla/webrender/WebRenderTypes.h"
+#endif
 
 #include "Decoder.h"
+#include "imgFrame.h"
 
 using namespace mozilla::gfx;
 using namespace mozilla::layers;
@@ -30,7 +38,16 @@ DecodedSurfaceProvider::DecodedSurfaceProvider(NotNull<RasterImage*> aImage,
              "Use AnimationSurfaceProvider for animation decodes");
 }
 
-DecodedSurfaceProvider::~DecodedSurfaceProvider() { DropImageReference(); }
+DecodedSurfaceProvider::~DecodedSurfaceProvider() {
+#ifdef __EMSCRIPTEN__
+  if (mGpuExternalId != 0) {
+    // Drops the RenderHostGpuTextureHost, which frees the host-side GL texture.
+    wr::RenderThread::Get()->UnregisterExternalImage(
+        wr::ToExternalImageId(mGpuExternalId));
+  }
+#endif
+  DropImageReference();
+}
 
 void DecodedSurfaceProvider::DropImageReference() {
   if (!mImage) {
@@ -210,6 +227,28 @@ nsresult DecodedSurfaceProvider::UpdateKey(
     layers::RenderRootStateManager* aManager,
     wr::IpcResourceUpdateQueue& aResources, wr::ImageKey& aKey) {
   MOZ_ASSERT(mSurface);
+
+#ifdef __EMSCRIPTEN__
+  // Host-GPU image passthrough: this surface's pixels are a host-uploaded GL
+  // texture registered as a WebRender external image -- submit it as such (no CPU
+  // surface / texture-cache upload). Key + registration are created once.
+  uint64_t extId = mSurface->HostGpuExternalImage();
+  if (extId != 0) {
+    if (!mGpuKey) {
+      wr::WrImageKey key = aManager->WrBridge()->GetNextImageKey();
+      IntSize size = mSurface->GetSize();
+      wr::ImageDescriptor descriptor(size, size.width * 4,
+                                     gfx::SurfaceFormat::R8G8B8A8);
+      aResources.AddHostGpuExternalImage(wr::ToExternalImageId(extId), key,
+                                         descriptor);
+      mGpuKey = Some(key);
+      mGpuExternalId = extId;
+    }
+    aKey = mGpuKey.value();
+    return NS_OK;
+  }
+#endif
+
   RefPtr<SourceSurface> surface = mSurface->GetSourceSurface();
   if (!surface) {
     return NS_ERROR_FAILURE;

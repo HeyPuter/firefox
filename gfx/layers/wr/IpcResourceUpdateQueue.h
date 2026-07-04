@@ -134,6 +134,11 @@ class IpcResourceUpdateQueue {
 
   void AddSharedExternalImage(wr::ExternalImageId aExtId, wr::ImageKey aKey);
 
+  // Host-GPU image passthrough: register an external image backed by a host-
+  // uploaded GL texture (RenderHostGpuTextureHost). See OpAddHostGpuExternalImage.
+  void AddHostGpuExternalImage(wr::ExternalImageId aExtId, wr::ImageKey aKey,
+                               const ImageDescriptor& aDescriptor);
+
   void PushExternalImageForTexture(wr::ExternalImageId aExtId,
                                    wr::ImageKey aKey,
                                    layers::TextureClient* aTexture,

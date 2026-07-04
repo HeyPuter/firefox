@@ -37,6 +37,14 @@ if CONFIG["MOZ_JXL"]:
         "nsJXLDecoder.cpp",
     ]
 
+# Routes image decode to the host browser's WebCodecs ImageDecoder (opt-in via
+# GECKO_IMG_PASSTHROUGH). Non-unified so its control-block macros don't leak into
+# the neighbouring decoders' unified blob.
+if CONFIG["OS_TARGET"] == "EMSCRIPTEN":
+    SOURCES += [
+        "nsHostProxyImageDecoder.cpp",
+    ]
+
 include("/ipc/chromium/chromium-config.mozbuild")
 
 LOCAL_INCLUDES += [

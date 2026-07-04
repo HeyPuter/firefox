@@ -1417,6 +1417,18 @@ Document* nsIWidget::GetDocument() const {
       return presShell->GetDocument();
     }
   }
+#if defined(__EMSCRIPTEN__)
+  // Windowless content (PuppetWidget) attaches its PresShell via the ATTACHED
+  // widget listener, not mWidgetListener, so the base lookup returns null. Fall
+  // back to it -- otherwise APZ's SetTargetAPZC subframe-activation no-ops (no
+  // document), nested overflow:scroll containers never get an APZC, and APZ
+  // mis-targets the root. See gfxPlatform::AsyncPanZoomEnabled / embed-input.
+  if (mAttachedWidgetListener) {
+    if (PresShell* presShell = mAttachedWidgetListener->GetPresShell()) {
+      return presShell->GetDocument();
+    }
+  }
+#endif
   return nullptr;
 }
 

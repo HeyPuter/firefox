@@ -44,6 +44,14 @@ struct OpAddSharedExternalImage {
   ImageKey key;
 };
 
+// Host-GPU image passthrough: register an external image backed by a GL texture
+// the host browser uploaded on the Renderer thread (RenderHostGpuTextureHost).
+struct OpAddHostGpuExternalImage {
+  ExternalImageId externalImageId;
+  ImageKey key;
+  ImageDescriptor descriptor;
+};
+
 struct OpPushExternalImageForTexture {
   ExternalImageId externalImageId;
   ImageKey key;
@@ -198,6 +206,7 @@ union OpUpdateResource {
   OpAddFontInstance;
   OpDeleteFontInstance;
   OpAddSharedExternalImage;
+  OpAddHostGpuExternalImage;
   OpPushExternalImageForTexture;
   OpUpdateSharedExternalImage;
 };

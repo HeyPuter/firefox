@@ -199,6 +199,38 @@ class WebRenderBridgeParent final : public PWebRenderBridgeParent,
 
   void Destroy();
 
+  // In-process direct dispatch: when the compositor is in this process, a
+  // WebRenderBridgeChild hands the transaction's moved C++ payload straight to
+  // the compositor thread instead of through IPDL (skipping Pickle
+  // serialization). GetInProcess() finds the parent for a pipeline id; the
+  // InProcess* methods run on the compositor thread, translate child-side actor
+  // references (PTexture) to this side via Lookup(), then invoke the Recv path.
+  // Opt-in: only populated when GECKO_WR_DIRECT is set in the environment.
+  static already_AddRefed<WebRenderBridgeParent> GetInProcess(
+      uint64_t aPipelineId);
+  void InProcessUpdateResources(const wr::IdNamespace& aIdNamespace,
+                                nsTArray<OpUpdateResource>&& aUpdates,
+                                nsTArray<RefCountedShmem>&& aSmallShmems,
+                                nsTArray<ipc::Shmem>&& aLargeShmems);
+  void InProcessParentCommands(const wr::IdNamespace& aIdNamespace,
+                               nsTArray<WebRenderParentCommand>&& aCommands);
+  void InProcessNewCompositable(const CompositableHandle& aHandle,
+                                const TextureInfo& aInfo);
+  void InProcessReleaseCompositable(const CompositableHandle& aHandle);
+  void InProcessSetDisplayList(
+      DisplayListData&& aDisplayList, nsTArray<OpDestroy>&& aToDestroy,
+      uint64_t aFwdTransactionId, TransactionId aTransactionId,
+      bool aContainsSVGGroup, VsyncId aVsyncId, TimeStamp aVsyncStartTime,
+      TimeStamp aRefreshStartTime, TimeStamp aTxnStartTime, nsCString aTxnURL,
+      TimeStamp aFwdTime, nsTArray<CompositionPayload>&& aPayloads,
+      bool aRenderOffscreen);
+  void InProcessEmptyTransaction(
+      const FocusTarget& aFocusTarget, Maybe<TransactionData>&& aTransactionData,
+      nsTArray<OpDestroy>&& aToDestroy, uint64_t aFwdTransactionId,
+      TransactionId aTransactionId, VsyncId aVsyncId, TimeStamp aVsyncStartTime,
+      TimeStamp aRefreshStartTime, TimeStamp aTxnStartTime, nsCString aTxnURL,
+      TimeStamp aFwdTime, nsTArray<CompositionPayload>&& aPayloads);
+
   // CompositorVsyncSchedulerOwner
   bool IsPendingComposite() override { return false; }
   void FinishPendingComposite() override {}
@@ -375,6 +407,11 @@ class WebRenderBridgeParent final : public PWebRenderBridgeParent,
                        wr::TransactionBuilder& aUpdates);
   bool AddSharedExternalImage(wr::ExternalImageId aExtId, wr::ImageKey aKey,
                               wr::TransactionBuilder& aResources);
+#ifdef __EMSCRIPTEN__
+  bool AddHostGpuExternalImage(wr::ExternalImageId aExtId, wr::ImageKey aKey,
+                               const wr::ImageDescriptor& aDescriptor,
+                               wr::TransactionBuilder& aResources);
+#endif
   bool UpdateSharedExternalImage(
       wr::ExternalImageId aExtId, wr::ImageKey aKey,
       const ImageIntRect& aDirtyRect, wr::TransactionBuilder& aResources,
@@ -399,6 +436,14 @@ class WebRenderBridgeParent final : public PWebRenderBridgeParent,
 
   void DeleteImage(const wr::ImageKey& aKey, wr::TransactionBuilder& aUpdates);
   void ReleaseTextureOfImage(const wr::ImageKey& aKey);
+
+  void RegisterInProcess();
+  void UnregisterInProcess();
+  void XlateTexture(
+      NotNull<ipc::SideVariant<PTextureParent*, PTextureChild*>>& aField);
+  void TranslateActors(nsTArray<OpDestroy>& aOps);
+  void TranslateActors(nsTArray<WebRenderParentCommand>& aCommands);
+  void TranslateActors(nsTArray<OpUpdateResource>& aUpdates);
 
   bool ProcessWebRenderParentCommands(
       const nsTArray<WebRenderParentCommand>& aCommands,

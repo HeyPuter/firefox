@@ -296,6 +296,17 @@ nsIWidget::ContentAndAPZEventStatus PuppetWidget::DispatchInputEvent(
     return status;
   }
 
+#if defined(__EMSCRIPTEN__)
+  // Single-process wasm: APZ is wired LOCALLY on this widget (mAPZC, via the
+  // in-process compositor) and there is no mBrowserChild to forward input to.
+  // Use the base-class APZ routing (mAPZC->InputBridge()->ReceiveInputEvent +
+  // ProcessUntransformedAPZEvent) instead of the remote SendDispatch* path below,
+  // which would otherwise drop the event here (mBrowserChild is null).
+  if (mAPZC && !mBrowserChild) {
+    return nsIWidget::DispatchInputEvent(aEvent);
+  }
+#endif
+
   if (!mBrowserChild) {
     return status;
   }
@@ -493,6 +504,17 @@ void PuppetWidget::UpdateZoomConstraints(
 }
 
 bool PuppetWidget::AsyncPanZoomEnabled() const {
+#if defined(__EMSCRIPTEN__)
+  // Single-process wasm: the in-process compositor (GetWindowRenderer ->
+  // CreateCompositor) wires an APZCTreeManager directly on this widget (mAPZC),
+  // so report APZ enabled when it is present. mBrowserChild is null here, so the
+  // default IPC-based check below would otherwise always return false -- which
+  // also suppresses WebRenderLayerManager sending scroll data (no hit-testing
+  // tree for APZ) and routes wheel input around APZ.
+  if (mAPZC) {
+    return true;
+  }
+#endif
   return mBrowserChild && mBrowserChild->AsyncPanZoomEnabled();
 }
 

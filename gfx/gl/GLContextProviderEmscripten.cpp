@@ -27,6 +27,7 @@
 #include <emscripten/html5_webgl.h>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <pthread.h>
 
 // The page canvas the embedder renders into (embed-xul/index.html: <canvas id="screen">).
@@ -56,6 +57,15 @@ static bool ContentPassthroughEnabled() {
 // browser implicit-presents the OffscreenCanvas to its #screen placeholder. Requires
 // the final link's -sJSPI.
 extern "C" void gl_present_yield(void);
+
+// Host-GPU image passthrough: when the compositor GL context is created on the
+// Renderer thread, record this thread's id + install the JS handler that uploads
+// host-decoded VideoFrames into this context (see hostimg-bridge.js,
+// RenderHostGpuTextureHost). Both are no-ops unless GECKO_IMG_PASSTHROUGH=gpu.
+extern "C" {
+void hostimg_set_renderer_tid(int aTid);
+void hostimg_renderer_install(void);
+}
 
 // emscripten_webgl_get_proc_address is provided by emscripten's GL JS library at the
 // final link, so it is undefined in this relocatable libxul.so. Taking its address
@@ -126,6 +136,17 @@ class GLContextEmscripten final : public GLContext {
         *out_failureId = "FEATURE_FAILURE_EMSCRIPTEN_WEBGL_INIT"_ns;
       }
       return nullptr;
+    }
+
+    // Host-GPU image passthrough: this is the compositor context, created on the
+    // Renderer thread (#screen transferred here). Register the thread + install
+    // the VideoFrame upload handler so host-decoded images can be composited as
+    // WebRender external textures with no CPU readback.
+    const char* imgPass = getenv("GECKO_IMG_PASSTHROUGH");
+    if (present && imgPass && !strcmp(imgPass, "gpu")) {
+      gl->MakeCurrent();
+      hostimg_set_renderer_tid(static_cast<int>(pthread_self()));
+      hostimg_renderer_install();
     }
     return gl;
   }

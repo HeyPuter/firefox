@@ -17,8 +17,14 @@
 #include "mozilla/CheckedInt.h"
 #include "mozilla/Range.h"
 #include "mozilla/EnumeratedRange.h"
+#include "mozilla/StaticMutex.h"
 #include "mozilla/StaticPrefs_gfx.h"
 #include "mozilla/StaticPrefs_webgl.h"
+#include "mozilla/layers/PTextureParent.h"
+#include "mozilla/layers/PTextureChild.h"
+#include "mozilla/ipc/SideVariant.h"
+#include "nsTHashMap.h"
+#include "prenv.h"
 #include "mozilla/UniquePtr.h"
 #include "mozilla/gfx/gfxVars.h"
 #include "mozilla/gfx/GPUParent.h"
@@ -48,6 +54,9 @@
 #include "mozilla/TimeStamp.h"
 #include "mozilla/webrender/RenderTextureHostSWGL.h"
 #include "mozilla/webrender/RenderThread.h"
+#ifdef __EMSCRIPTEN__
+#  include "mozilla/webrender/RenderHostGpuTextureHost.h"
+#endif
 #include "mozilla/widget/CompositorWidget.h"
 
 #ifdef XP_WIN
@@ -349,6 +358,7 @@ WebRenderBridgeParent::WebRenderBridgeParent(
 
   mRemoteTextureTxnScheduler =
       RemoteTextureTxnScheduler::Create(aCompositorBridge);
+  RegisterInProcess();
 }
 
 WebRenderBridgeParent::WebRenderBridgeParent(
@@ -376,6 +386,7 @@ WebRenderBridgeParent::WebRenderBridgeParent(
   mLateInit->mAsyncImageManager->AddPipeline(mPipelineId, this);
   mRemoteTextureTxnScheduler =
       RemoteTextureTxnScheduler::Create(aCompositorBridge);
+  RegisterInProcess();
 }
 
 WebRenderBridgeParent::WebRenderBridgeParent(const wr::PipelineId& aPipelineId,
@@ -398,6 +409,169 @@ WebRenderBridgeParent::WebRenderBridgeParent(const wr::PipelineId& aPipelineId,
 WebRenderBridgeParent::~WebRenderBridgeParent() {
   LOG("WebRenderBridgeParent::~WebRenderBridgeParent() PipelineId %" PRIx64 "",
       wr::AsUint64(mPipelineId));
+}
+
+// In-process direct-dispatch registry. The map owns a strong ref so a registered
+// parent is always alive for a lookup (no cross-thread refcount-revival race);
+// teardown removes it in Destroy(). Opt-in via GECKO_WR_DIRECT.
+static StaticMutex sWRBPRegistryMutex;
+static nsTHashMap<uint64_t, RefPtr<WebRenderBridgeParent>>* sWRBPRegistry =
+    nullptr;
+
+static bool WRDirectEnabled() {
+  static const bool sEnabled = !!PR_GetEnv("GECKO_WR_DIRECT");
+  return sEnabled;
+}
+
+void WebRenderBridgeParent::RegisterInProcess() {
+  if (!WRDirectEnabled()) {
+    return;
+  }
+  static bool sLogged = false;
+  if (!sLogged) {
+    sLogged = true;
+    printf("WR-DIRECT: in-process WebRender transaction path enabled\n");
+  }
+  StaticMutexAutoLock lock(sWRBPRegistryMutex);
+  if (!sWRBPRegistry) {
+    sWRBPRegistry = new nsTHashMap<uint64_t, RefPtr<WebRenderBridgeParent>>();
+  }
+  sWRBPRegistry->InsertOrUpdate(wr::AsUint64(mPipelineId), this);
+}
+
+void WebRenderBridgeParent::UnregisterInProcess() {
+  StaticMutexAutoLock lock(sWRBPRegistryMutex);
+  if (sWRBPRegistry) {
+    sWRBPRegistry->Remove(wr::AsUint64(mPipelineId));
+  }
+}
+
+/* static */
+already_AddRefed<WebRenderBridgeParent> WebRenderBridgeParent::GetInProcess(
+    uint64_t aPipelineId) {
+  StaticMutexAutoLock lock(sWRBPRegistryMutex);
+  if (!sWRBPRegistry) {
+    return nullptr;
+  }
+  RefPtr<WebRenderBridgeParent> parent;
+  sWRBPRegistry->Get(aPipelineId, &parent);
+  return parent.forget();
+}
+
+void WebRenderBridgeParent::XlateTexture(
+    NotNull<ipc::SideVariant<PTextureParent*, PTextureChild*>>& aField) {
+  if (aField.IsParent()) {
+    return;
+  }
+  PTextureChild* child = aField.AsChild().get();
+  IProtocol* actor = Lookup(child->Id());
+  MOZ_ASSERT(actor, "in-process PTexture has no parent-side actor");
+  if (!actor) {
+    return;
+  }
+  ipc::SideVariant<PTextureParent*, PTextureChild*> sv;
+  sv = static_cast<PTextureParent*>(actor);
+  aField = WrapNotNull(sv);
+}
+
+void WebRenderBridgeParent::TranslateActors(nsTArray<OpDestroy>& aOps) {
+  for (auto& op : aOps) {
+    if (op.type() == OpDestroy::TPTexture) {
+      XlateTexture(op.get_PTexture());
+    }
+  }
+}
+
+void WebRenderBridgeParent::TranslateActors(
+    nsTArray<WebRenderParentCommand>& aCommands) {
+  for (auto& cmd : aCommands) {
+    if (cmd.type() != WebRenderParentCommand::TCompositableOperation) {
+      continue;
+    }
+    auto& detail = cmd.get_CompositableOperation().detail();
+    switch (detail.type()) {
+      case CompositableOperationDetail::TOpRemoveTexture:
+        XlateTexture(detail.get_OpRemoveTexture().texture());
+        break;
+      case CompositableOperationDetail::TOpUseTexture:
+        for (auto& tt : detail.get_OpUseTexture().textures()) {
+          XlateTexture(tt.texture());
+        }
+        break;
+      default:
+        break;
+    }
+  }
+}
+
+void WebRenderBridgeParent::TranslateActors(
+    nsTArray<OpUpdateResource>& aUpdates) {
+  for (auto& up : aUpdates) {
+    if (up.type() == OpUpdateResource::TOpPushExternalImageForTexture) {
+      XlateTexture(up.get_OpPushExternalImageForTexture().texture());
+    }
+  }
+}
+
+void WebRenderBridgeParent::InProcessUpdateResources(
+    const wr::IdNamespace& aIdNamespace, nsTArray<OpUpdateResource>&& aUpdates,
+    nsTArray<RefCountedShmem>&& aSmallShmems,
+    nsTArray<ipc::Shmem>&& aLargeShmems) {
+  TranslateActors(aUpdates);
+  (void)RecvUpdateResources(aIdNamespace, std::move(aUpdates),
+                            std::move(aSmallShmems), std::move(aLargeShmems));
+}
+
+void WebRenderBridgeParent::InProcessParentCommands(
+    const wr::IdNamespace& aIdNamespace,
+    nsTArray<WebRenderParentCommand>&& aCommands) {
+  TranslateActors(aCommands);
+  (void)RecvParentCommands(aIdNamespace, std::move(aCommands));
+}
+
+void WebRenderBridgeParent::InProcessNewCompositable(
+    const CompositableHandle& aHandle, const TextureInfo& aInfo) {
+  (void)RecvNewCompositable(aHandle, aInfo);
+}
+
+void WebRenderBridgeParent::InProcessReleaseCompositable(
+    const CompositableHandle& aHandle) {
+  (void)RecvReleaseCompositable(aHandle);
+}
+
+void WebRenderBridgeParent::InProcessSetDisplayList(
+    DisplayListData&& aDisplayList, nsTArray<OpDestroy>&& aToDestroy,
+    uint64_t aFwdTransactionId, TransactionId aTransactionId,
+    bool aContainsSVGGroup, VsyncId aVsyncId, TimeStamp aVsyncStartTime,
+    TimeStamp aRefreshStartTime, TimeStamp aTxnStartTime, nsCString aTxnURL,
+    TimeStamp aFwdTime, nsTArray<CompositionPayload>&& aPayloads,
+    bool aRenderOffscreen) {
+  TranslateActors(aToDestroy);
+  TranslateActors(aDisplayList.mCommands);
+  TranslateActors(aDisplayList.mResourceUpdates);
+  (void)RecvSetDisplayList(
+      std::move(aDisplayList), std::move(aToDestroy), aFwdTransactionId,
+      aTransactionId, aContainsSVGGroup, aVsyncId, aVsyncStartTime,
+      aRefreshStartTime, aTxnStartTime, aTxnURL, aFwdTime, std::move(aPayloads),
+      aRenderOffscreen);
+}
+
+void WebRenderBridgeParent::InProcessEmptyTransaction(
+    const FocusTarget& aFocusTarget, Maybe<TransactionData>&& aTransactionData,
+    nsTArray<OpDestroy>&& aToDestroy, uint64_t aFwdTransactionId,
+    TransactionId aTransactionId, VsyncId aVsyncId, TimeStamp aVsyncStartTime,
+    TimeStamp aRefreshStartTime, TimeStamp aTxnStartTime, nsCString aTxnURL,
+    TimeStamp aFwdTime, nsTArray<CompositionPayload>&& aPayloads) {
+  TranslateActors(aToDestroy);
+  if (aTransactionData) {
+    TranslateActors(aTransactionData->mCommands);
+    TranslateActors(aTransactionData->mResourceUpdates);
+  }
+  (void)RecvEmptyTransaction(aFocusTarget, std::move(aTransactionData),
+                             std::move(aToDestroy), aFwdTransactionId,
+                             aTransactionId, aVsyncId, aVsyncStartTime,
+                             aRefreshStartTime, aTxnStartTime, aTxnURL, aFwdTime,
+                             std::move(aPayloads));
 }
 
 /* static */
@@ -534,6 +708,7 @@ mozilla::ipc::IPCResult WebRenderBridgeParent::HandleShutdown() {
 }
 
 void WebRenderBridgeParent::Destroy() {
+  UnregisterInProcess();
   if (!EnsureInitialized()) {
     return;
   }
@@ -740,6 +915,16 @@ bool WebRenderBridgeParent::UpdateResources(
         }
         break;
       }
+#ifdef __EMSCRIPTEN__
+      case OpUpdateResource::TOpAddHostGpuExternalImage: {
+        const auto& op = cmd.get_OpAddHostGpuExternalImage();
+        if (!AddHostGpuExternalImage(op.externalImageId(), op.key(),
+                                     op.descriptor(), aUpdates)) {
+          success = false;
+        }
+        break;
+      }
+#endif
       case OpUpdateResource::TOpPushExternalImageForTexture: {
         const auto& op = cmd.get_OpPushExternalImageForTexture();
         CompositableTextureHostRef texture;
@@ -863,6 +1048,27 @@ bool WebRenderBridgeParent::UpdateResources(
   MOZ_ASSERT(success);
   return success;
 }
+
+#ifdef __EMSCRIPTEN__
+bool WebRenderBridgeParent::AddHostGpuExternalImage(
+    wr::ExternalImageId aExtId, wr::ImageKey aKey,
+    const wr::ImageDescriptor& aDescriptor, wr::TransactionBuilder& aResources) {
+  if (!MatchesNamespace(aKey)) {
+    MOZ_ASSERT_UNREACHABLE("Stale host-gpu external image key!");
+    return true;
+  }
+  gfx::IntSize size(aDescriptor.width, aDescriptor.height);
+  // The texture is uploaded + owned host-side (RenderHostGpuTextureHost::Lock
+  // fetches it from the Renderer-thread GL.textures table by external id).
+  wr::RenderThread::Get()->RegisterExternalImage(
+      aExtId,
+      MakeAndAddRef<wr::RenderHostGpuTextureHost>(wr::AsUint64(aExtId), size));
+  auto imageType =
+      wr::ExternalImageType::TextureHandle(wr::ImageBufferKind::Texture2D);
+  aResources.AddExternalImage(aKey, aDescriptor, aExtId, imageType, 0);
+  return true;
+}
+#endif
 
 bool WebRenderBridgeParent::AddSharedExternalImage(
     wr::ExternalImageId aExtId, wr::ImageKey aKey,

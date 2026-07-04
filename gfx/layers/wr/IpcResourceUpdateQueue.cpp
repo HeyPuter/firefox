@@ -346,6 +346,13 @@ void IpcResourceUpdateQueue::AddSharedExternalImage(wr::ExternalImageId aExtId,
   mUpdates.AppendElement(layers::OpAddSharedExternalImage(aExtId, aKey));
 }
 
+void IpcResourceUpdateQueue::AddHostGpuExternalImage(
+    wr::ExternalImageId aExtId, wr::ImageKey aKey,
+    const ImageDescriptor& aDescriptor) {
+  mUpdates.AppendElement(
+      layers::OpAddHostGpuExternalImage(aExtId, aKey, aDescriptor));
+}
+
 void IpcResourceUpdateQueue::PushExternalImageForTexture(
     wr::ExternalImageId aExtId, wr::ImageKey aKey,
     layers::TextureClient* aTexture, bool aIsUpdate) {

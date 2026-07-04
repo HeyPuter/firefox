@@ -178,6 +178,12 @@ void ModifyWakeLockWithChildID(const nsAString& aTopic,
     return;
   }
 
+  // sLockTable is null when hal::Init() never ran (headless/embedded wasm
+  // builds); skip rather than dereference it. Mirrors GetWakeLockInfo below.
+  if (!sLockTable) {
+    return;
+  }
+
   LockCount processCount;
   LockCount totalCount;
   ProcessLockTable* const table =

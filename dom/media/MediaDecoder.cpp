@@ -484,6 +484,12 @@ void MediaDecoder::OnDecoderDoctorEvent(DecoderDoctorEvent aEvent) {
   MOZ_ASSERT(NS_IsMainThread());
   // OnDecoderDoctorEvent is disconnected at shutdown time.
   MOZ_DIAGNOSTIC_ASSERT(!IsShutdown());
+#ifdef __EMSCRIPTEN__
+  if (aEvent.mDomain == DecoderDoctorEvent::eAudioSinkStartup &&
+      aEvent.mResult == NS_ERROR_DOM_MEDIA_CUBEB_INITIALIZATION_ERR) {
+    return;
+  }
+#endif
   Document* doc = GetOwner()->GetDocument();
   if (!doc) {
     return;

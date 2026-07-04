@@ -2781,9 +2781,31 @@ PRIntervalTime _PR_UNIX_TicksPerSecond() {
 #endif
 
 #if defined(_PR_HAVE_CLOCK_MONOTONIC)
+#if defined(__EMSCRIPTEN__)
+/* Coarse-clock fast path (GECKO_COARSE_CLOCK): read the embedder's shared-heap
+ * nanosecond clock instead of clock_gettime, skipping the per-call wasm->JS
+ * performance.now() crossing. Weak so a build without the embedder degrades to the
+ * real clock. The single monotonic writer + atomic load make the value
+ * non-decreasing, so no clamp is needed. See gecko.js/src/embed-xul.cpp. */
+extern int gecko_coarse_clock_enabled(void) __attribute__((weak));
+extern long long* gecko_coarse_now_ptr(void) __attribute__((weak));
+#endif
 PRIntervalTime _PR_UNIX_GetInterval2() {
   struct timespec time;
   PRIntervalTime ticks;
+
+#if defined(__EMSCRIPTEN__)
+  if (gecko_coarse_clock_enabled && gecko_coarse_clock_enabled() &&
+      gecko_coarse_now_ptr) {
+    long long* coarsePtr = gecko_coarse_now_ptr();
+    if (coarsePtr) {
+      long long coarseNs = __atomic_load_n(coarsePtr, __ATOMIC_RELAXED);
+      if (coarseNs > 0) {
+        return (PRIntervalTime)((unsigned long long)coarseNs / PR_NSEC_PER_MSEC);
+      }
+    }
+  }
+#endif
 
   if (clock_gettime(CLOCK_MONOTONIC, &time) != 0) {
     fprintf(stderr, "clock_gettime failed: %d\n", errno);

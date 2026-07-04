@@ -3988,6 +3988,16 @@ bool gfxPlatform::UseDesktopZoomingScrollbars() {
 
 /*static*/
 bool gfxPlatform::AsyncPanZoomEnabled() {
+#if defined(__EMSCRIPTEN__)
+  // The wasm embedding is single-process (no e10s) but runs an in-process
+  // WebRender compositor. The layers.async-pan-zoom.enabled pref defaults to true
+  // (and is mirror:once, so a late runtime SetBool can't reliably disable it), and
+  // the e10s/Fission gates below would also force it on -- so gate APZ directly on
+  // the GECKO_APZ env var instead. Cleanly opt-in: default OFF -> the correct
+  // layout-hit-test scroll path (APZ-on currently mis-targets nested scroll
+  // containers because subframe displayports aren't activated -- see embed-input).
+  return getenv("GECKO_APZ") != nullptr;
+#endif
 #if !defined(MOZ_WIDGET_ANDROID) && !defined(MOZ_WIDGET_UIKIT)
   // For XUL applications (everything but Firefox on Android)
   // we only want to use APZ when E10S is enabled. If

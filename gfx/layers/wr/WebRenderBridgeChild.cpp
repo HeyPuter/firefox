@@ -14,7 +14,10 @@
 #include "mozilla/layers/StackingContextHelper.h"
 #include "mozilla/layers/PTextureChild.h"
 #include "mozilla/layers/WebRenderLayerManager.h"
+#include "mozilla/layers/WebRenderBridgeParent.h"
+#include "mozilla/layers/CompositorThread.h"
 #include "mozilla/webrender/WebRenderAPI.h"
+#include "nsThreadUtils.h"
 #include "PDMFactory.h"
 
 namespace mozilla {
@@ -106,8 +109,20 @@ void WebRenderBridgeChild::UpdateResources(
   nsTArray<ipc::Shmem> largeShmems;
   aResources.Flush(resourceUpdates, smallShmems, largeShmems);
 
-  this->SendUpdateResources(mIdNamespace, resourceUpdates, smallShmems,
-                            std::move(largeShmems));
+  if (RefPtr<WebRenderBridgeParent> p =
+          WebRenderBridgeParent::GetInProcess(wr::AsUint64(mPipelineId));
+      p && CompositorThread()) {
+    CompositorThread()->Dispatch(NS_NewRunnableFunction(
+        "WRBridgeInProcessUpdateResources",
+        [p, ns = mIdNamespace, u = std::move(resourceUpdates),
+         s = std::move(smallShmems), l = std::move(largeShmems)]() mutable {
+          p->InProcessUpdateResources(ns, std::move(u), std::move(s),
+                                      std::move(l));
+        }));
+  } else {
+    this->SendUpdateResources(mIdNamespace, resourceUpdates, smallShmems,
+                              std::move(largeShmems));
+  }
 }
 
 bool WebRenderBridgeChild::EndTransaction(
@@ -133,11 +148,31 @@ bool WebRenderBridgeChild::EndTransaction(
   }
 
   mSentDisplayList = true;
-  bool ret = this->SendSetDisplayList(
-      std::move(aDisplayListData), mDestroyedActors, GetFwdTransactionId(),
-      aTransactionId, aContainsSVGGroup, aVsyncId, aVsyncStartTime,
-      aRefreshStartTime, aTxnStartTime, aTxnURL, fwdTime, payloads,
-      aRenderOffscreen);
+  bool ret = true;
+  if (RefPtr<WebRenderBridgeParent> p =
+          WebRenderBridgeParent::GetInProcess(wr::AsUint64(mPipelineId));
+      p && CompositorThread()) {
+    CompositorThread()->Dispatch(NS_NewRunnableFunction(
+        "WRBridgeInProcessSetDisplayList",
+        [p, dl = std::move(aDisplayListData),
+         destroy = std::move(mDestroyedActors), fwdTxn = GetFwdTransactionId(),
+         txnId = aTransactionId, svg = aContainsSVGGroup, vsyncId = aVsyncId,
+         vsyncStart = aVsyncStartTime, refreshStart = aRefreshStartTime,
+         txnStart = aTxnStartTime, url = nsCString(aTxnURL), fwdTime,
+         pl = std::move(payloads),
+         offscreen = aRenderOffscreen]() mutable {
+          p->InProcessSetDisplayList(
+              std::move(dl), std::move(destroy), fwdTxn, txnId, svg, vsyncId,
+              vsyncStart, refreshStart, txnStart, url, fwdTime, std::move(pl),
+              offscreen);
+        }));
+  } else {
+    ret = this->SendSetDisplayList(
+        std::move(aDisplayListData), mDestroyedActors, GetFwdTransactionId(),
+        aTransactionId, aContainsSVGGroup, aVsyncId, aVsyncStartTime,
+        aRefreshStartTime, aTxnStartTime, aTxnURL, fwdTime, payloads,
+        aRenderOffscreen);
+  }
 
   // With multiple render roots, we may not have sent all of our
   // mParentCommands, so go ahead and go through our mParentCommands and ensure
@@ -170,10 +205,28 @@ void WebRenderBridgeChild::EndEmptyTransaction(
     mManager->TakeCompositionPayloads(payloads);
   }
 
-  this->SendEmptyTransaction(
-      aFocusTarget, std::move(aTransactionData), mDestroyedActors,
-      GetFwdTransactionId(), aTransactionId, aVsyncId, aVsyncStartTime,
-      aRefreshStartTime, aTxnStartTime, aTxnURL, fwdTime, payloads);
+  if (RefPtr<WebRenderBridgeParent> p =
+          WebRenderBridgeParent::GetInProcess(wr::AsUint64(mPipelineId));
+      p && CompositorThread()) {
+    CompositorThread()->Dispatch(NS_NewRunnableFunction(
+        "WRBridgeInProcessEmptyTransaction",
+        [p, focus = aFocusTarget, txnData = std::move(aTransactionData),
+         destroy = std::move(mDestroyedActors), fwdTxn = GetFwdTransactionId(),
+         txnId = aTransactionId, vsyncId = aVsyncId,
+         vsyncStart = aVsyncStartTime, refreshStart = aRefreshStartTime,
+         txnStart = aTxnStartTime, url = nsCString(aTxnURL), fwdTime,
+         pl = std::move(payloads)]() mutable {
+          p->InProcessEmptyTransaction(
+              focus, std::move(txnData), std::move(destroy), fwdTxn, txnId,
+              vsyncId, vsyncStart, refreshStart, txnStart, url, fwdTime,
+              std::move(pl));
+        }));
+  } else {
+    this->SendEmptyTransaction(
+        aFocusTarget, std::move(aTransactionData), mDestroyedActors,
+        GetFwdTransactionId(), aTransactionId, aVsyncId, aVsyncStartTime,
+        aRefreshStartTime, aTxnStartTime, aTxnURL, fwdTime, payloads);
+  }
 
   // With multiple render roots, we may not have sent all of our
   // mParentCommands, so go ahead and go through our mParentCommands and ensure
@@ -188,7 +241,17 @@ void WebRenderBridgeChild::ProcessWebRenderParentCommands() {
 
   if (HasWebRenderParentCommands()) {
     MergeWebRenderParentCommands();
-    this->SendParentCommands(mIdNamespace, mParentCommands);
+    if (RefPtr<WebRenderBridgeParent> p =
+            WebRenderBridgeParent::GetInProcess(wr::AsUint64(mPipelineId));
+        p && CompositorThread()) {
+      CompositorThread()->Dispatch(NS_NewRunnableFunction(
+          "WRBridgeInProcessParentCommands",
+          [p, ns = mIdNamespace, cmds = std::move(mParentCommands)]() mutable {
+            p->InProcessParentCommands(ns, std::move(cmds));
+          }));
+    } else {
+      this->SendParentCommands(mIdNamespace, mParentCommands);
+    }
     mParentCommands.Clear();
   }
 }
@@ -379,7 +442,17 @@ void WebRenderBridgeChild::Connect(CompositableClient* aCompositable,
   mCompositables.InsertOrUpdate(uint64_t(handle), aCompositable);
 
   aCompositable->InitIPDL(handle);
-  SendNewCompositable(handle, aCompositable->GetTextureInfo());
+  if (RefPtr<WebRenderBridgeParent> p =
+          WebRenderBridgeParent::GetInProcess(wr::AsUint64(mPipelineId));
+      p && CompositorThread()) {
+    CompositorThread()->Dispatch(NS_NewRunnableFunction(
+        "WRBridgeInProcessNewCompositable",
+        [p, handle, info = aCompositable->GetTextureInfo()]() mutable {
+          p->InProcessNewCompositable(handle, info);
+        }));
+  } else {
+    SendNewCompositable(handle, aCompositable->GetTextureInfo());
+  }
 }
 
 bool WebRenderBridgeChild::AddOpDestroy(const OpDestroy& aOp) {
@@ -399,7 +472,15 @@ void WebRenderBridgeChild::ReleaseCompositable(
     return;
   }
   if (!DestroyInTransaction(aHandle)) {
-    SendReleaseCompositable(aHandle);
+    if (RefPtr<WebRenderBridgeParent> p =
+            WebRenderBridgeParent::GetInProcess(wr::AsUint64(mPipelineId));
+        p && CompositorThread()) {
+      CompositorThread()->Dispatch(NS_NewRunnableFunction(
+          "WRBridgeInProcessReleaseCompositable",
+          [p, h = aHandle]() mutable { p->InProcessReleaseCompositable(h); }));
+    } else {
+      SendReleaseCompositable(aHandle);
+    }
   }
   mCompositables.Remove(aHandle.Value());
 }

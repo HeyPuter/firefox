@@ -56,6 +56,9 @@
 #include <functional>
 
 #include "FFVPXRuntimeLinker.h"
+#ifdef __EMSCRIPTEN__
+#  include "WebCodecsProxyDecoderModule.h"
+#endif
 
 using DecodeSupport = mozilla::media::DecodeSupport;
 using DecodeSupportSet = mozilla::media::DecodeSupportSet;
@@ -762,6 +765,9 @@ void PDMFactory::CreateDefaultPDMs() {
   }
 #endif
 
+#ifdef __EMSCRIPTEN__
+  StartupPDM(WebCodecsProxyDecoderModule::Create());
+#endif
   StartupPDM(AgnosticDecoderModule::Create(),
              StaticPrefs::media_prefer_non_ffvpx());
 

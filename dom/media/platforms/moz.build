@@ -46,6 +46,9 @@ UNIFIED_SOURCES += [
 
 DIRS += ["agnostic/bytestreams", "agnostic/eme", "agnostic/gmp", "omx"]
 
+if CONFIG["OS_TARGET"] == "EMSCRIPTEN":
+    DIRS += ["wasm"]
+
 if CONFIG["MOZ_WMF"]:
     DIRS += ["wmf"]
 
