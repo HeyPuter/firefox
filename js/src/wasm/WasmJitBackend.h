@@ -176,6 +176,9 @@ enum WJHelpKind : int {
   WJH_FROMCODEPOINT = 110,      // scratch[0]=codePoint(boxed Int32, guaranteed 0..0x10FFFF by a JIT deopt-guard) -> String; MFromCodePoint via js::StringFromCodePoint. String.fromCodePoint / string iteration. May GC/OOM.
   WJH_ISPACKEDARRAY = 111,      // scratch[0]=object(boxed) -> Boolean; MIsPackedArray via js::IsPackedArray (pure read: ArrayObject && initLen==len && packed). Array fast-path checks (spread/Reflect/from). No GC/throw.
   WJH_GETPROPSUPER = 112,       // scratch[0]=object/super-base(Object), [1]=receiver/this(boxed), [2]=idval/key(boxed) -> Value; MGetPropSuperCache via ToPropertyKey + js::GetProperty(obj,receiver,id) (super.prop / super[expr]). May GC/throw.
+  WJH_ASYNCRESOLVE = 113,       // scratch[0]=generator(AsyncFunctionGeneratorObject, boxed Object), [1]=value(boxed) -> Object; MAsyncResolve via js::AsyncFunctionResolve (resolves an async fn's promise at its return/resolve point). May GC/OOM. Async fns bailed whole-fn to PBL here (reddit.com).
+  WJH_CANSKIPAWAIT = 114,       // scratch[0]=value(boxed) -> Boolean; MCanSkipAwait via js::CanSkipAwait (await-skip optimization: true when the awaited value isn't a thenable). May GC (getter on .then/.constructor).
+  WJH_EXTRACTAWAITVALUE = 115,  // scratch[0]=value(boxed) -> Value; MMaybeExtractAwaitValue's can-skip branch via js::ExtractAwaitValue (unwrap the already-resolved await value). May GC.
 };
 // MNewLexicalEnvironmentObject: the LexicalScope* baked from the template object.
 extern uint32_t gWJLexScope;

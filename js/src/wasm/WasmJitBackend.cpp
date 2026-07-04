@@ -41,8 +41,11 @@ extern "C" void WJAddOsrTarget(uint32_t pcOff, uint32_t blockIdx);
 #include "vm/BytecodeUtil.h"  // GetNextPc
 #include "vm/JSScript.h"  // PCToLineNumber (precise bail op location)
 #include "vm/JSFunction.h"
+#include "vm/GetterSetter.h"  // LoadGetterSetterFunction offsets
 #include "vm/JSObject.h"
 #include "vm/NativeObject.h"
+#include "vm/Caches.h"        // js::MegamorphicCache (inline megamorphic prop cache)
+#include "vm/PropertyKey.h"   // HashPropertyKeyThreadSafe (megamorphic cache hash)
 #include "vm/Iteration.h"  // NativeIterator/PropertyIndex layout (LoadSlotByIteratorIndex)
 #include "vm/BoundFunctionObject.h"     // offsetOfFlagsSlot/NumBoundArgsShift (BoundFunctionNumArgs)
 #include "vm/ProxyObject.h"             // offsetOfPrivateSlot (LoadWrapperTarget)
@@ -2329,6 +2332,106 @@ static bool EmitPropIC(Encoder& e, WJBackend& be, MInstruction* ins,
     return true;
   };
 
+  // MEGAMORPHIC CACHE fallback (GECKO_WJ_MEGACACHE, default-OFF): when the per-site
+  // monomorphic/poly ways all MISS, consult the per-runtime js::MegamorphicCache for an
+  // OWN data property (hopsAndKind_==0) before the WJH_PROPIC C++ hop -- megamorphic
+  // React/DOM sites (the discord.com/login GETPROP/PROPIC 450K-hop ceiling) hit here.
+  // Constant key -> compile-time hash + key. Cache base is a stable per-runtime addr.
+  static int megaCacheEnv = getenv("GECKO_WJ_MEGACACHE") ? 1 : 0;
+  uintptr_t megaCacheAddr = 0;
+  uint32_t megaHashConst = 0;
+  if (megaCacheEnv) {
+    JSContext* mcx = js::TlsContext.get();
+    if (mcx) {
+      megaCacheAddr = uintptr_t(&mcx->runtime()->caches().megamorphicCache);
+      megaHashConst = uint32_t(
+          js::HashPropertyKeyThreadSafe(JS::PropertyKey::fromRawBits(keyBits)));
+    }
+  }
+  auto emitHelperMiss = [&]() -> bool {
+    return EmitStageScratch(e, be, object, 0) &&
+           EmitHelperCallResult(e, be, ins, WJH_PROPIC, site);
+  };
+  auto emitMegaOrMiss = [&]() -> bool {
+    if (!megaCacheAddr) return emitHelperMiss();
+    using MC = js::MegamorphicCache;
+    using ME = js::MegamorphicCacheEntry;
+    // MEGAMORPHIC GATE: only consult the mega cache when this SITE is saturated (all
+    // kWJPropWays populated) -- i.e. genuinely megamorphic. A low-poly site (some ways
+    // still empty) is served by the ways; running the mega hash+lookup on its misses is
+    // pure overhead (navier's numeric field access regressed ~28% without this gate).
+    // allFull = (way0 != 0) & (way1 != 0) & ...  -> if !allFull, straight to helper.
+    if (!e.writeOp(Op::I32Const) || !e.writeVarS32(int32_t(shapeArr + base * 4)) ||
+        !e.writeOp(Op::I32Load) || !e.writeVarU32(2) || !e.writeVarU32(0) ||
+        !e.writeOp(Op::I32Eqz) || !e.writeOp(Op::I32Eqz))
+      return false;  // (way0 != 0) as 0/1
+    for (uint32_t w = 1; w < kWJPropWays; w++) {
+      if (!e.writeOp(Op::I32Const) ||
+          !e.writeVarS32(int32_t(shapeArr + (base + w) * 4)) ||
+          !e.writeOp(Op::I32Load) || !e.writeVarU32(2) || !e.writeVarU32(0) ||
+          !e.writeOp(Op::I32Eqz) || !e.writeOp(Op::I32Eqz) || !e.writeOp(Op::I32And))
+        return false;  // & (wayW != 0)
+    }
+    if (!e.writeOp(Op::If) || !e.writeFixedU8(uint8_t(TypeCode::I64))) return false;
+    // h = ((shape>>S1) ^ (shape>>S2) + hashConst) & (NumEntries-1)  ; entry in propTaggedLocal
+    if (!GetLocal(e, be.propShapeLocal) || !e.writeOp(Op::I32Const) ||
+        !e.writeVarS32(MC::ShapeHashShift1) || !e.writeOp(Op::I32ShrU) ||
+        !GetLocal(e, be.propShapeLocal) || !e.writeOp(Op::I32Const) ||
+        !e.writeVarS32(MC::ShapeHashShift2) || !e.writeOp(Op::I32ShrU) ||
+        !e.writeOp(Op::I32Xor) || !e.writeOp(Op::I32Const) ||
+        !e.writeVarS32(int32_t(megaHashConst)) || !e.writeOp(Op::I32Add) ||
+        !e.writeOp(Op::I32Const) || !e.writeVarS32(int32_t(MC::NumEntries - 1)) ||
+        !e.writeOp(Op::I32And) || !e.writeOp(Op::I32Const) ||
+        !e.writeVarS32(int32_t(sizeof(MC::Entry))) || !e.writeOp(Op::I32Mul) ||
+        !e.writeOp(Op::I32Const) ||
+        !e.writeVarS32(int32_t(megaCacheAddr + MC::offsetOfEntries())) ||
+        !e.writeOp(Op::I32Add) || !e.writeOp(Op::LocalSet) ||
+        !e.writeVarU32(be.propTaggedLocal))
+      return false;
+    // cond = shape==entry.shape & key==entry.key & gen==entry.gen & entry.hopsAndKind==0
+    if (!GetLocal(e, be.propTaggedLocal) || !e.writeOp(Op::I32Load) ||
+        !e.writeVarU32(2) || !e.writeVarU32(uint32_t(ME::offsetOfShape())) ||
+        !GetLocal(e, be.propShapeLocal) || !e.writeOp(Op::I32Eq))
+      return false;
+    if (!GetLocal(e, be.propTaggedLocal) || !e.writeOp(Op::I32Load) ||
+        !e.writeVarU32(2) || !e.writeVarU32(uint32_t(ME::offsetOfKey())) ||
+        !e.writeOp(Op::I32Const) || !e.writeVarS32(int32_t(uint32_t(keyBits))) ||
+        !e.writeOp(Op::I32Eq) || !e.writeOp(Op::I32And))
+      return false;
+    if (!GetLocal(e, be.propTaggedLocal) || !e.writeOp(Op::I32Load16U) ||
+        !e.writeVarU32(1) || !e.writeVarU32(uint32_t(ME::offsetOfGeneration())) ||
+        !e.writeOp(Op::I32Const) ||
+        !e.writeVarS32(int32_t(megaCacheAddr + MC::offsetOfGeneration())) ||
+        !e.writeOp(Op::I32Load16U) || !e.writeVarU32(1) || !e.writeVarU32(0) ||
+        !e.writeOp(Op::I32Eq) || !e.writeOp(Op::I32And))
+      return false;
+    if (!GetLocal(e, be.propTaggedLocal) || !e.writeOp(Op::I32Load8U) ||
+        !e.writeVarU32(0) || !e.writeVarU32(uint32_t(ME::offsetOfHopsAndKind())) ||
+        !e.writeOp(Op::I32Eqz) || !e.writeOp(Op::I32And))
+      return false;
+    if (!e.writeOp(Op::If) || !e.writeFixedU8(uint8_t(TypeCode::I64))) return false;
+    // hit: tag = entry.slotOffset (reuse propShapeLocal); base = (tag&1)?obj:obj->slots; +(tag>>1)
+    if (!GetLocal(e, be.propTaggedLocal) || !e.writeOp(Op::I32Load) ||
+        !e.writeVarU32(2) || !e.writeVarU32(uint32_t(ME::offsetOfSlotOffset())) ||
+        !e.writeOp(Op::LocalSet) || !e.writeVarU32(be.propShapeLocal))
+      return false;
+    if (!GetLocal(e, be.propObjLocal) || !GetLocal(e, be.propObjLocal) ||
+        !e.writeOp(Op::I32Load) || !e.writeVarU32(2) ||
+        !e.writeVarU32(uint32_t(js::NativeObject::offsetOfSlots())) ||
+        !GetLocal(e, be.propShapeLocal) || !e.writeOp(Op::I32Const) ||
+        !e.writeVarS32(1) || !e.writeOp(Op::I32And) || !e.writeOp(Op::SelectNumeric))
+      return false;  // (tag&1)?obj:slots
+    if (!GetLocal(e, be.propShapeLocal) || !e.writeOp(Op::I32Const) ||
+        !e.writeVarS32(1) || !e.writeOp(Op::I32ShrU) || !e.writeOp(Op::I32Add) ||
+        !e.writeOp(Op::I64Load) || !e.writeVarU32(3) || !e.writeVarU32(0))
+      return false;  // [value]
+    if (!e.writeOp(Op::Else)) return false;    // cond (shape/key/gen/hops) mismatch
+    if (!emitHelperMiss()) return false;
+    if (!e.writeOp(Op::End)) return false;     // close cond-if
+    if (!e.writeOp(Op::Else)) return false;    // !allFull (site not yet megamorphic)
+    if (!emitHelperMiss()) return false;
+    return e.writeOp(Op::End);                  // close allFull-if
+  };
   // Runtime-cache ways + helper miss path (the polymorphic fallback). Each way:
   // gWJPropShape[base+w] == propShape ? load that way's (runtime) tagged offset.
   auto emitWaysAndHelper = [&]() -> bool {
@@ -2343,8 +2446,7 @@ static bool EmitPropIC(Encoder& e, WJBackend& be, MInstruction* ins,
       if (!emitSlotLoad(w)) return false;
       if (!e.writeOp(Op::Else)) return false;
     }
-    if (!EmitStageScratch(e, be, object, 0)) return false;
-    if (!EmitHelperCallResult(e, be, ins, WJH_PROPIC, site)) return false;
+    if (!emitMegaOrMiss()) return false;
     for (uint32_t w = 0; w < kWJPropWays; w++) {
       if (!e.writeOp(Op::End)) return false;
     }
@@ -4884,6 +4986,44 @@ static bool EmitValue(Encoder& e, WJBackend& be, MInstruction* ins) {
       if (!EmitHelperCallResult(e, be, ins, WJH_GETPROPSUPER, 0)) return false;
       return EmitHelperResultAsType(e, be, jit::MIRType::Value);
     }
+    case MDefinition::Opcode::AsyncResolve: {
+      // MAsyncResolve: resolve an async fn's promise at its return/resolve point via
+      // js::AsyncFunctionResolve(cx, generator, value) -> the promise Object. Whole async
+      // fns bailed to PBL here (reddit.com x3). Stage generator (Object) + value (boxed);
+      // may GC/OOM. GECKO_WJ_NOASYNCRESOLVE reverts.
+      if (getenv("GECKO_WJ_NOASYNCRESOLVE")) return false;
+      auto* a = ins->toAsyncResolve();
+      if (!EmitStageScratch(e, be, a->generator(), 0)) return false;  // generator (Object)
+      if (!EmitStageScratch(e, be, a->value(), 1)) return false;  // value (Value)
+      if (!EmitHelperCallResult(e, be, ins, WJH_ASYNCRESOLVE, 0)) return false;
+      return EmitHelperResultAsType(e, be, jit::MIRType::Object);
+    }
+    case MDefinition::Opcode::CanSkipAwait: {
+      // Await-skip optimization: MCanSkipAwait -> Boolean via js::CanSkipAwait (true if
+      // the awaited value is not a thenable, so await resolves synchronously). Pairs with
+      // MaybeExtractAwaitValue below; both bailed async fns to PBL (reddit.com). May GC.
+      if (getenv("GECKO_WJ_NOAWAITSKIP")) return false;
+      if (!EmitStageScratch(e, be, ins->getOperand(0), 0)) return false;
+      if (!EmitHelperCallResult(e, be, ins, WJH_CANSKIPAWAIT, 0)) return false;
+      return EmitHelperResultAsType(e, be, jit::MIRType::Boolean);
+    }
+    case MDefinition::Opcode::MaybeExtractAwaitValue: {
+      // if canSkip -> js::ExtractAwaitValue(value) (unwrap the resolved value); else pass
+      // `value` through unchanged. Mirrors Ion visitMaybeExtractAwaitValue. Result Value.
+      if (getenv("GECKO_WJ_NOAWAITSKIP")) return false;
+      auto* m = ins->toMaybeExtractAwaitValue();
+      int32_t cl = be.local(m->canSkip()), vl = be.local(m->value());
+      if (cl < 0 || vl < 0) return false;
+      if (!GetLocal(e, uint32_t(cl))) return false;                 // canSkip (i32 bool)
+      if (!e.writeOp(Op::If) || !e.writeFixedU8(0x7E)) return false;  // result i64 (Value)
+      if (!EmitStageScratch(e, be, m->value(), 0) ||
+          !EmitHelperCallResult(e, be, ins, WJH_EXTRACTAWAITVALUE, 0) ||
+          !EmitHelperResultAsType(e, be, jit::MIRType::Value))
+        return false;
+      if (!e.writeOp(Op::Else)) return false;
+      if (!GetLocal(e, uint32_t(vl))) return false;                 // passthrough value
+      return e.writeOp(Op::End);
+    }
     case MDefinition::Opcode::GuardProto: {
       // Guard obj's static prototype == expected; deopt on mismatch. Mirrors
       // visitGuardProto (loadObjProto + branch-not-equal bailout). No helper;
@@ -4971,6 +5111,56 @@ static bool EmitValue(Encoder& e, WJBackend& be, MInstruction* ins) {
       int32_t l = be.local(ins->getOperand(0));
       if (l < 0) return false;
       return GetLocal(e, uint32_t(l));
+    }
+    case MDefinition::Opcode::GuardFunctionIsNonBuiltinCtor: {
+      // Deopt unless the function is a non-builtin constructor: (flags & mask) ==
+      // (BASESCRIPT|CONSTRUCTOR), i.e. it has BASESCRIPT+CONSTRUCTOR and is NOT
+      // SELF_HOSTED. Mirrors MacroAssembler::branchIfNotFunctionIsNonBuiltinCtor
+      // (load the 32-bit flagsAndArgCount word, flags in the low bits). Passthrough
+      // the function object. (discord.com/login bailed a fn here.)
+      int32_t l = be.local(ins->getOperand(0));
+      if (l < 0) return false;
+      constexpr int32_t mask = js::FunctionFlags::BASESCRIPT |
+                               js::FunctionFlags::SELF_HOSTED |
+                               js::FunctionFlags::CONSTRUCTOR;
+      constexpr int32_t expected =
+          js::FunctionFlags::BASESCRIPT | js::FunctionFlags::CONSTRUCTOR;
+      if (!GetLocal(e, uint32_t(l)) || !e.writeOp(Op::I32Load) || !e.writeVarU32(2) ||
+          !e.writeVarU32(uint32_t(JSFunction::offsetOfFlagsAndArgCount())) ||
+          !e.writeOp(Op::I32Const) || !e.writeVarS32(mask) || !e.writeOp(Op::I32And) ||
+          !e.writeOp(Op::I32Const) || !e.writeVarS32(expected) ||
+          !e.writeOp(Op::I32Ne))
+        return false;
+      if (!e.writeOp(Op::If) || !e.writeFixedU8(0x40)) return false;
+      if (!EmitDeopt(e, be)) return false;
+      if (!e.writeOp(Op::End)) return false;
+      return GetLocal(e, uint32_t(l));  // passthrough the function object
+    }
+    case MDefinition::Opcode::LoadGetterSetterFunction: {
+      // getterSetter is a Value boxing a GetterSetter* (JSVAL_TYPE_PRIVATE_GCTHING);
+      // its payload is the raw ptr in the low 32 bits. Load the getter or setter
+      // JSFunction* at the fixed offset, DEOPT if null. Mirrors Ion
+      // visitLoadGetterSetterFunction. needsClassGuard (the accessor may be a
+      // non-function -- rare) -> bail; the object-is-function class check isn't
+      // inlined here. (discord.com/login bailed 3 fns here.)
+      auto* lgs = ins->toLoadGetterSetterFunction();
+      if (lgs->needsClassGuard()) return false;
+      int32_t l = be.local(lgs->getterSetter());
+      if (l < 0) return false;
+      uint32_t off = uint32_t(lgs->isGetter() ? js::GetterSetter::offsetOfGetter()
+                                              : js::GetterSetter::offsetOfSetter());
+      // gs* = low32(box); fn = *(gs+off) (zero-extended into unboxScratch)
+      if (!GetLocal(e, uint32_t(l)) || !e.writeOp(Op::I32WrapI64) ||
+          !e.writeOp(Op::I32Load) || !e.writeVarU32(2) || !e.writeVarU32(off) ||
+          !e.writeOp(Op::I64ExtendI32U) || !e.writeOp(Op::LocalSet) ||
+          !e.writeVarU32(be.unboxScratch))
+        return false;
+      // fn == null -> deopt
+      if (!GetLocal(e, be.unboxScratch) || !e.writeOp(Op::I64Eqz)) return false;
+      if (!e.writeOp(Op::If) || !e.writeFixedU8(0x40)) return false;
+      if (!EmitDeopt(e, be)) return false;
+      if (!e.writeOp(Op::End)) return false;
+      return GetLocal(e, be.unboxScratch) && e.writeOp(Op::I32WrapI64);  // fn (Object)
     }
     case MDefinition::Opcode::GuardNullOrUndefined: {
       // Deopt unless the value's tag is NULL or UNDEFINED; passthrough the value.
@@ -8136,6 +8326,42 @@ static bool EmitValue(Encoder& e, WJBackend& be, MInstruction* ins) {
       if (!EmitDeopt(e, be)) return false;
       if (!e.writeOp(Op::End)) return false;
       return GetLocal(e, be.unboxScratch);                          // [argValue] (Value)
+    }
+    case MDefinition::Opcode::InArray: {
+      // `index in array` dense fast path -> Boolean. operands: elements(Elements ptr),
+      // index(Int32), initLength(Int32). Mirrors Ion visitInArray: in-bounds AND the
+      // element is not a HOLE (JS_ELEMENTS_HOLE magic) -> true. Out-of-bounds -> false,
+      // EXCEPT a NEGATIVE index deopts when needsNegativeIntCheck (Ion bails; `-1 in a`
+      // is a real property lookup PBL handles). GECKO_WJ_NOINARRAY reverts.
+      if (getenv("GECKO_WJ_NOINARRAY")) return false;
+      auto* a = ins->toInArray();
+      // (unsigned) index >= initLength ?  (also true for a negative index)
+      if (!GetOp(e, be, a->index()) || !GetOp(e, be, a->initLength()) ||
+          !e.writeOp(Op::I32GeU))
+        return false;
+      if (!e.writeOp(Op::If) || !e.writeFixedU8(0x7F)) return false;  // result i32
+      // out of bounds: deopt on a genuine negative index (needsNegativeIntCheck), else false
+      if (a->needsNegativeIntCheck()) {
+        if (!GetOp(e, be, a->index()) || !e.writeOp(Op::I32Const) ||
+            !e.writeVarS32(0) || !e.writeOp(Op::I32LtS))
+          return false;
+        if (!e.writeOp(Op::If) || !e.writeFixedU8(0x40)) return false;
+        if (!EmitDeopt(e, be)) return false;
+        if (!e.writeOp(Op::End)) return false;
+      }
+      if (!e.writeOp(Op::I32Const) || !e.writeVarS32(0)) return false;  // false
+      if (!e.writeOp(Op::Else)) return false;
+      // in bounds: value = *(elements + index*8); present = (tag != MAGIC)
+      if (!GetOp(e, be, a->elements()) || !GetOp(e, be, a->index()) ||
+          !e.writeOp(Op::I32Const) || !e.writeVarS32(8) || !e.writeOp(Op::I32Mul) ||
+          !e.writeOp(Op::I32Add) || !e.writeOp(Op::I64Load) || !e.writeVarU32(3) ||
+          !e.writeVarU32(0))
+        return false;  // [value i64]
+      if (!e.writeOp(Op::I64Const) || !e.writeVarS64(32) || !e.writeOp(Op::I64ShrU) ||
+          !e.writeOp(Op::I32WrapI64) || !e.writeOp(Op::I32Const) ||
+          !e.writeVarS32(int32_t(TagWord(JSVAL_TYPE_MAGIC))) || !e.writeOp(Op::I32Ne))
+        return false;  // tag != MAGIC -> present(1) ; hole -> 0
+      return e.writeOp(Op::End);
     }
     case MDefinition::Opcode::CheckThis: {
       // `this` TDZ guard in a derived-class constructor: throw

@@ -68,6 +68,8 @@
 
 #include "vm/NativeObject-inl.h"
 #include "vm/ObjectOperations-inl.h"  // js::GetProperty(obj,receiver,id) (WJH_GETPROPSUPER)
+#include "vm/AsyncFunction.h"  // js::AsyncFunctionResolve (WJH_ASYNCRESOLVE)
+#include "builtin/Promise.h"  // js::CanSkipAwait / js::ExtractAwaitValue (await-skip)
 #include "vm/PlainObject-inl.h"  // createWithShape
 #include "vm/Interpreter-inl.h"  // GetElementOperation
 #include "vm/JSObject-inl.h"     // GuessArrayGCKind
@@ -2885,6 +2887,39 @@ static double wjhelpImpl(double kindF, double siteF) {
     JSObject* obj = &JS::Value::fromRawBits(gWJScratch[0]).toObject();
     gWJScratch[js::wasm::kWJResultSlot] =
         JS::BooleanValue(js::IsPackedArray(obj)).asRawBits();
+    return 0.0;
+  }
+
+  if (kind == js::wasm::WJH_CANSKIPAWAIT) {
+    // MCanSkipAwait: true if the awaited value isn't a thenable (await can resolve
+    // synchronously). js::CanSkipAwait returns success + the flag via out-param.
+    JS::RootedValue val(cx, JS::Value::fromRawBits(gWJScratch[0]));
+    bool canSkip = false;
+    if (!js::CanSkipAwait(cx, val, &canSkip)) return 1.0;
+    gWJScratch[js::wasm::kWJResultSlot] = JS::BooleanValue(canSkip).asRawBits();
+    return 0.0;
+  }
+
+  if (kind == js::wasm::WJH_EXTRACTAWAITVALUE) {
+    // MMaybeExtractAwaitValue (can-skip branch): unwrap the already-resolved value.
+    JS::RootedValue val(cx, JS::Value::fromRawBits(gWJScratch[0]));
+    JS::RootedValue out(cx);
+    if (!js::ExtractAwaitValue(cx, val, &out)) return 1.0;
+    gWJScratch[js::wasm::kWJResultSlot] = out.get().asRawBits();
+    return 0.0;
+  }
+
+  if (kind == js::wasm::WJH_ASYNCRESOLVE) {
+    // MAsyncResolve: resolve an async fn's promise with `value`, return the promise.
+    // generator (scratch[0]) is an AsyncFunctionGeneratorObject boxed as an Object Value.
+    JS::Rooted<js::AsyncFunctionGeneratorObject*> gen(
+        cx, &JS::Value::fromRawBits(gWJScratch[0])
+                 .toObject()
+                 .as<js::AsyncFunctionGeneratorObject>());
+    JS::RootedValue value(cx, JS::Value::fromRawBits(gWJScratch[1]));
+    JSObject* promise = js::AsyncFunctionResolve(cx, gen, value);
+    if (!promise) return 1.0;
+    gWJScratch[js::wasm::kWJResultSlot] = JS::ObjectValue(*promise).asRawBits();
     return 0.0;
   }
 
