@@ -80,6 +80,8 @@ extern bool WasmJitObserveCall(JSScript* script);
 extern int WasmJitRunCall(JSScript* script, uint64_t thisBits,
                           const JS::Value* args, uint32_t argc,
                           JSObject* envChain, uint64_t* retBits);
+// Boxed RUNTIME callee for the JIT entry (MCallee rooting; see WasmJitBackend.cpp).
+extern uint64_t gWJCallCallee;
 }  // namespace wasm
 }  // namespace js
 #endif
@@ -135,6 +137,19 @@ static bool gPBLResumeKeepEnv = false;
 // catch/finally in PBL (Warp skips catch blocks, so the JIT cannot run them). No
 // re-execution of the throwing op. Cleared on consume.
 static bool gPBLResumeInError = false;
+// Cross-wasm-boundary EXCEPTION UNWIND carry. When a resumed (nested) PBI
+// returns Unwind/UnwindError whose target frame lies in an OUTER PBI
+// activation (HandleException already found the catch in the SHARED portable
+// stack, prepared the target frame's pc/stack, and consumed the pending
+// exception), the intermediate wasm frames can only propagate a flag -- the
+// unwind TARGET must be carried here so the outer PBI's call-into-JIT site
+// can continue its own unwind chain instead of erroring with no exception.
+static bool gPBLUnwinding = false;
+static void* gPBLUnwindFP = nullptr;
+static void* gPBLUnwindSP = nullptr;
+static JS::Value gPBLUnwindExc;
+static JS::Value gPBLUnwindExcStack;
+static bool gPBLUnwindHaveExc = false;
 
 // Whether to compile interpreter dispatch loops using computed gotos
 // or direct switches.
@@ -2483,6 +2498,7 @@ uint64_t ICInterpretOps(uint64_t arg0, uint64_t arg1, ICStub* stub,
                   reinterpret_cast<uint8_t*>(ctx.stack.fp));
               cx.getCx()->portableBaselineStack().top =
                   reinterpret_cast<void*>(sp);
+              js::wasm::gWJCallCallee = ObjectValue(*callee).asRawBits();
               wjr = js::wasm::WasmJitRunCall(script, args[0].asRawBits(),
                                              args + 1, argc,
                                              callee->environment(), &wbits);
@@ -2492,6 +2508,17 @@ uint64_t ICInterpretOps(uint64_t arg0, uint64_t arg1, ICStub* stub,
               POPNNATIVE(5);
             }
             if (wjr == 2) {  // Mode VS helper threw: propagate, do not re-run
+              if (gPBLUnwinding) {
+                // A cross-boundary exception unwind (catch target in THIS or an
+                // outer PBI activation, prepared by the inner HandleException):
+                // continue the unwind chain with the carried target instead of
+                // erroring with no pending exception.
+                gPBLUnwinding = false;
+                ctx.stack.unwindingFP = reinterpret_cast<StackVal*>(gPBLUnwindFP);
+                ctx.stack.unwindingSP = reinterpret_cast<StackVal*>(gPBLUnwindSP);
+                ctx.error = PBIResult::UnwindError;
+                return IC_ERROR_SENTINEL();
+              }
               ctx.error = PBIResult::Error;
               return IC_ERROR_SENTINEL();
             }
@@ -9323,6 +9350,18 @@ error:
       PUSH_EXIT_FRAME();
       HandleException(&rfe);
     }
+    // Save the in-flight exception: if the catch target lies BEYOND this PBI
+    // activation (cross-wasm-boundary unwind), the cross-activation return
+    // below RE-RAISES it so every boundary (interp or PBL) propagates a real
+    // pending exception and re-resolves the catch in its own activation.
+    if (rfe.kind == ExceptionResumeKind::Catch ||
+        rfe.kind == ExceptionResumeKind::Finally) {
+      gPBLUnwindExc = rfe.exception;
+      gPBLUnwindExcStack = rfe.exceptionStack;
+      gPBLUnwindHaveExc = true;
+    } else {
+      gPBLUnwindHaveExc = false;
+    }
 
     switch (rfe.kind) {
       case ExceptionResumeKind::EntryFrame:
@@ -9397,6 +9436,14 @@ unwind:
   if (reinterpret_cast<uintptr_t>(ctx.stack.unwindingFP) >
       reinterpret_cast<uintptr_t>(entryFrame) + BaselineFrame::Size()) {
     TRACE_PRINTF(" -> returning\n");
+    // Cross-activation: re-raise so callers across the wasm boundary see a
+    // real pending exception (see gPBLUnwindHaveExc).
+    if (gPBLUnwindHaveExc) {
+      JSContext* rcx = ctx.frameMgr.cxForLocalUseOnly();
+      JS::RootedValue rexc(rcx, gPBLUnwindExc);
+      rcx->setPendingException(rexc, js::ShouldCaptureStack::Maybe);
+      gPBLUnwindHaveExc = false;
+    }
     return PBIResult::Unwind;
   }
   sp = ctx.stack.unwindingSP;
@@ -9413,6 +9460,12 @@ unwind_error:
                entryFrame);
   if (reinterpret_cast<uintptr_t>(ctx.stack.unwindingFP) >
       reinterpret_cast<uintptr_t>(entryFrame) + BaselineFrame::Size()) {
+    if (gPBLUnwindHaveExc) {
+      JSContext* rcx = ctx.frameMgr.cxForLocalUseOnly();
+      JS::RootedValue rexc(rcx, gPBLUnwindExc);
+      rcx->setPendingException(rexc, js::ShouldCaptureStack::Maybe);
+      gPBLUnwindHaveExc = false;
+    }
     return PBIResult::UnwindError;
   }
   if (reinterpret_cast<uintptr_t>(ctx.stack.unwindingFP) ==
@@ -9565,9 +9618,70 @@ bool WasmJitResumeViaPBL(JSContext* cx, JSScript* script, uint64_t thisBits,
                          uint32_t pcOff, uint64_t* retBits,
                          const uint64_t* osrStack, uint32_t osrStackDepth,
                          JSObject* enclosingEnv, bool keepFrameEnv,
-                         bool resumeInError) {
-  JSFunction* fun = script->function();
+                         bool resumeInError, JSFunction* runtimeCallee) {
+  // The RUNTIME callee (the actual closure instance) when the deopt spilled it;
+  // the canonical script->function() is WRONG for closures sharing a script --
+  // JSOp::Callee in the resumed frame would push a function whose environment()
+  // is null/foreign (acorn-walk NFE self-recursion corruption).
+  if (resumeInError && gPBLUnwinding) {
+    // An active cross-boundary unwind is passing through this frame: its
+    // in-try deopt must not run HandleException (nothing pending) -- keep
+    // propagating until the outer PBI activation picks the unwind up.
+    return false;
+  }
+  JSFunction* fun = runtimeCallee ? runtimeCallee : script->function();
   if (!fun) return false;
+  // ENTRY-resume env fix: a deopt at the function's first bytecode (pcOff==0)
+  // resumes BEFORE the prologue builds the frame's own scope, so the initial
+  // environmentChain must be the callee closure's own environment() (its
+  // enclosing scope). The separately-spilled gWJResumeEnvPtr can be a FOREIGN
+  // closure's env when several closures SHARE a script (recast
+  // fixFaultyLocations: the upvar `fixForLoopHead` at enclosing-env slot 11 was
+  // read from the wrong closure's env -> a raw-unboxed value -> "5e-324 is not a
+  // function" in lebab). Use the runtime callee's env and let PBL's prologue
+  // rebuild the frame scope from it. Opt-in GECKO_WJ_ENTRYENVFIX while validating.
+  // The entry prologue (keepEnv==false path) sets the frame env to enclosingEnv
+  // (gPBLResumeEnclosingEnv) then rebuilds the own CallObject via
+  // InitFunctionEnvironmentObjects. Point enclosingEnv at the RUNTIME callee's
+  // environment (correct for a shared-script closure) and force the rebuild.
+  // DEFAULT-ON (2026-07-03): validated node (octane 11/11, typescript, acorn) +
+  // browser (2 correctness sweeps ALL PASS + entry-deopt A/B == PBL). Corrects a
+  // silent wrong-upvar bug: an entry (pc==0) deopt of a CallObject-owning fn kept
+  // the enclosing env as the frame env and skipped the prologue's CallObject
+  // creation, so GetAliasedVar upvar reads were one scope too high.
+  // GECKO_WJ_NOENTRYENVFIX reverts.
+  static int entryEnvFix = getenv("GECKO_WJ_NOENTRYENVFIX") ? 0 : 1;
+  {
+    static int envDbg = getenv("GECKO_WJ_ENTRYENVDBG") ? 1 : 0;
+    static int dbgLine = getenv("GECKO_WJ_ENTRYENVDBG") ? atoi(getenv("GECKO_WJ_ENTRYENVDBG")) : 0;
+    if (envDbg && pcOff == 0 && (dbgLine <= 1 || uint32_t(script->lineno()) == uint32_t(dbgLine))) {
+      static uint64_t n = 0;
+      if (n++ < 30)
+        fprintf(stderr,
+                "[wj-entryenv] %s:%u rtCallee=%p rtCalleeInterp=%d rtCalleeEnv=%p "
+                "sfEnv=%p spilledEnv=%p enclosing=%p keep=%d\n",
+                script->filename() ? script->filename() : "?",
+                unsigned(script->lineno()), (void*)runtimeCallee,
+                runtimeCallee ? int(runtimeCallee->isInterpreted()) : -1,
+                runtimeCallee && runtimeCallee->isInterpreted() ? (void*)runtimeCallee->environment() : nullptr,
+                script->function() ? (void*)script->function()->environment() : (void*)0x1,
+                (void*)envChain, (void*)enclosingEnv, int(keepFrameEnv));
+    }
+  }
+  // A pc==0 (function-entry) deopt resumes BEFORE the prologue creates the
+  // function's own CallObject. keepFrameEnv==true would keep the ENCLOSING env as
+  // the frame env and skip InitFunctionEnvironmentObjects, so upvar loads
+  // (JSOp::GetAliasedVar hops=1) read one scope too high -> garbage callee
+  // ("5e-324 is not a function" at recast fixFaultyLocations -> fixForLoopHead in
+  // lebab). Force the rebuild for functions that own environment objects, using
+  // the runtime callee's environment as the enclosing scope. Restricted to
+  // needsFunctionEnvironmentObjects so env-less functions (whose keep==true entry
+  // resume is already correct) are untouched.
+  if (entryEnvFix && pcOff == 0 && fun->isInterpreted() &&
+      fun->needsFunctionEnvironmentObjects() && fun->environment()) {
+    enclosingEnv = fun->environment();
+    keepFrameEnv = false;
+  }
   // Enter the function's realm: the resumed frame's realm must equal cx->realm() (the normal
   // call machinery does this; our direct re-entry must too, else the frame realm-check in
   // exception unwinding / DebugEpilogue asserts). Required when reached from js::Interpret.
@@ -9620,6 +9734,24 @@ bool WasmJitResumeViaPBL(JSContext* cx, JSScript* script, uint64_t thisBits,
   PBIResult ret = PortableBaselineInterpret<false, kHybridICsInterp>(
       cx, state, stack, sp, envChain, &result, pc, isd, nullptr, nullptr,
       nullptr, PBIResult::Ok, osrLocals, nLocals, osrStack, osrStackDepth);
+  // Cross-boundary unwind: the resumed code threw and HandleException resolved
+  // the catch to a frame in an OUTER PBI activation (target already prepared
+  // in the shared portable stack; pending exception consumed). Carry the
+  // unwind target across the wasm frames (see gPBLUnwinding).
+  if ((ret == PBIResult::Unwind || ret == PBIResult::UnwindError) &&
+      !JS_IsExceptionPending(cx)) {
+    gPBLUnwinding = true;
+    gPBLUnwindFP = stack.unwindingFP;
+    gPBLUnwindSP = stack.unwindingSP;
+  }
+  // GECKO_WJ_DEPTHDBG: a resume erroring WITHOUT a pending exception is the
+  // silent-failure class -- identify the PBIResult + frame.
+  static int resDbg = getenv("GECKO_WJ_DEPTHDBG") ? 1 : 0;
+  if (resDbg && ret != PBIResult::Ok && !JS_IsExceptionPending(cx)) {
+    fprintf(stderr, "[wj-pbi-noexc] ret=%d %s:%u pcOff=%u\n", int(ret),
+            script->filename() ? script->filename() : "?",
+            unsigned(script->lineno()), pcOff);
+  }
   gPBLResumeEnclosingEnv = nullptr;
   gPBLResumeKeepEnv = false;
   static int resumeResDbg = getenv("GECKO_WJ_RESUMERESDBG") ? 1 : 0;

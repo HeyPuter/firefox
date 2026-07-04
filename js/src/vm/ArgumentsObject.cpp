@@ -415,6 +415,27 @@ ArgumentsObject* ArgumentsObject::createFromValueArray(
 }
 
 /* static */
+ArgumentsObject* ArgumentsObject::createForWasmJit(JSContext* cx,
+                                                   HandleFunction callee,
+                                                   HandleObject scopeChain,
+                                                   const Value* actuals,
+                                                   uint32_t numActuals) {
+  // Root the raw actuals across create()'s allocations (which can GC), then
+  // build the arguments object via the same CopyInlinedArgs path as
+  // createFromValueArray -- but with NO MaxInlinedArgs cap (create() sizes the
+  // ArgumentsData for any numActuals). callee/scopeChain are already rooted
+  // Handles, so mapped-args forwarding to the CallObject stays sound.
+  RootedExternalValueArray rootedArgs(cx, numActuals,
+                                      const_cast<Value*>(actuals));
+  HandleValueArray argsArray =
+      HandleValueArray::fromMarkedLocation(numActuals, actuals);
+  RootedObject callObj(
+      cx, scopeChain->is<CallObject>() ? scopeChain.get() : nullptr);
+  CopyInlinedArgs copy(argsArray, callObj, callee);
+  return create(cx, callee, numActuals, copy);
+}
+
+/* static */
 ArgumentsObject* ArgumentsObject::createForInlinedIon(JSContext* cx,
                                                       Value* args,
                                                       HandleFunction callee,

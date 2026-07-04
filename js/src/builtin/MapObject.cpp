@@ -11,6 +11,7 @@
 #include "gc/GCContext.h"
 #include "jit/InlinableNatives.h"
 #include "js/MapAndSet.h"
+#include "js/friend/DumpFunctions.h"  // JS::DumpBacktrace (magic probe)
 #include "js/PropertyAndElement.h"  // JS_DefineFunctions
 #include "js/PropertySpec.h"
 #include "js/Utility.h"
@@ -50,6 +51,17 @@ static Value NormalizeDoubleValue(double d) {
 }
 
 bool HashableValue::setValue(JSContext* cx, const Value& v) {
+  // GECKO_WJ_MAGICPROBE: report a MAGIC value entering a Map/Set (leaked by
+  // miscompiled JIT code; it crashes later at iteration's whyMagic assert).
+  static int magicProbe = getenv("GECKO_WJ_MAGICPROBE") ? 1 : 0;
+  if (magicProbe && v.isMagic()) {
+    JS::AutoFilename af;
+    uint32_t line = 0;
+    JS::DescribeScriptedCaller(&af, cx, &line, nullptr);
+    fprintf(stderr, "[wj-magicprobe] MAGIC into HashableValue why=%d at %s:%u\n",
+            int(v.whyMagic()), af.get() ? af.get() : "?", unsigned(line));
+    DumpBacktrace(cx, stderr);
+  }
   if (v.isString()) {
     // Atomize so that hash() and operator==() are fast and infallible.
     JSString* str = AtomizeString(cx, v.toString());
@@ -1478,6 +1490,24 @@ SetObject* SetObject::createFromIterable(JSContext* cx, Handle<JSObject*> proto,
   }
 
   if (!iterable.isNullOrUndefined()) {
+    // GECKO_WJ_MAGICPROBE: dump the state of an ARRAY iterable that contains a
+    // magic dense element (JIT-built holey array diagnostics).
+    static int magicProbeCtor = getenv("GECKO_WJ_MAGICPROBE") ? 1 : 0;
+    if (magicProbeCtor && iterable.isObject() &&
+        iterable.toObject().is<js::ArrayObject>()) {
+      js::ArrayObject* arr = &iterable.toObject().as<js::ArrayObject>();
+      uint32_t initLen = arr->getDenseInitializedLength();
+      for (uint32_t i = 0; i < initLen; i++) {
+        const Value& ev = arr->getDenseElement(i);
+        if (ev.isMagic()) {
+          fprintf(stderr,
+                  "[wj-magicprobe] Set ctor: ARRAY len=%u initLen=%u packed=%d "
+                  "elem[%u] isMagic why=%d\n",
+                  arr->length(), initLen, arr->denseElementsArePacked() ? 1 : 0,
+                  i, int(ev.whyMagic()));
+        }
+      }
+    }
     bool optimized = false;
     if (!obj->tryOptimizeCtorWithIterable(cx, iterable, &optimized)) {
       return nullptr;

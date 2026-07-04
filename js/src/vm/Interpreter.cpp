@@ -412,6 +412,10 @@ extern bool WasmJitObserveCall(JSScript* script);
 extern int WasmJitRunCall(JSScript* script, uint64_t thisBits,
                           const JS::Value* argv, uint32_t argc,
                           JSObject* envChain, uint64_t* retBits);
+// The boxed RUNTIME callee, published before every JIT entry so compiled code
+// can root it for MCallee (closures sharing a script differ from the canonical
+// function; see WasmJitBackend.cpp usesCallee).
+extern uint64_t gWJCallCallee;
 }  // namespace wasm
 }  // namespace js
 #endif
@@ -3291,6 +3295,7 @@ bool MOZ_NEVER_INLINE JS_HAZ_JSNATIVE_CALLER js::Interpret(JSContext* cx,
         if (wjScript->getWarmUpCount() >= 10 &&
             js::wasm::WasmJitObserveCall(wjScript)) {
           uint64_t wbits;
+          js::wasm::gWJCallCallee = ObjectValue(*maybeFun).asRawBits();
           int wjr = js::wasm::WasmJitRunCall(wjScript, args.thisv().asRawBits(),
                                              args.array(), args.length(),
                                              maybeFun->environment(), &wbits);

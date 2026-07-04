@@ -237,6 +237,15 @@ class ArgumentsObject : public NativeObject {
                                                HandleObject scopeChain,
                                                uint32_t numActuals);
 
+  // Like createFromValueArray but for the wasm JIT: takes a raw actuals array
+  // (roots it internally via RootedExternalValueArray) with NO MaxInlinedArgs
+  // cap. The wasm JIT has no JitFrameLayout, but it does have all actuals in
+  // wasm params, so it stages them into a buffer and calls this.
+  static ArgumentsObject* createForWasmJit(JSContext* cx, HandleFunction callee,
+                                           HandleObject scopeChain,
+                                           const Value* actuals,
+                                           uint32_t numActuals);
+
  private:
   template <typename CopyArgs>
   static ArgumentsObject* finishPure(JSContext* cx, ArgumentsObject* obj,

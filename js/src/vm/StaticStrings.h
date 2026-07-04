@@ -95,6 +95,11 @@ class StaticStrings {
     return unitStaticTable[c];
   }
 
+  // wasm JS->wasm JIT: base address of the permanent unit-string table, so the
+  // JIT can inline FromCharCode's `code < UNIT_STATIC_LIMIT` fast path as a direct
+  // table load (no VM helper). Entries are permanent atoms (no GC/rooting hazard).
+  JSAtom** unitStaticTableBase() { return unitStaticTable; }
+
   /* May not return atom, returns null on (reported) failure. */
   inline JSLinearString* getUnitString(JSContext* cx, char16_t c);
 

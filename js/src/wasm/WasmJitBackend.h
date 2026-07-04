@@ -89,8 +89,11 @@ enum WJHelpKind : int {
   WJH_NEWOBJECT = 27,     // gWJNewObjScript/gWJNewObjPcOff -> NewObjectOperation (object literal)
   WJH_BINDNAME = 28,      // scratch[0]=envChain, scratch[1]=name(StringValue) -> LookupNameUnqualified (Object)
   WJH_GROWSLOTS = 29,     // scratch[0]=object, gWJNewAux=newCapacity -> NativeObject::growSlotsPure (AllocateAndStoreSlot)
-  WJH_CHECKCELL = 30,     // DEBUG: gWJHelpObj = ptr to validate; abort if forwarded/invalid (GECKO_WJ_STOREVALIDATE)
   WJH_TOINT32 = 30,       // scratch[0]=value -> JS::ToInt32 (Int32); no-deopt ToInt32 for `x|0`/`&` on a boxed value
+  WJH_CHECKCELL = 251,    // DEBUG (GECKO_WJ_STOREVALIDATE): gWJHelpObj = ptr to validate; abort if forwarded/invalid.
+                          // High UNIQUE sentinel — MUST NOT collide with any real WJHelpKind (was 30 == WJH_TOINT32,
+                          // which would make TruncateToInt32(non-number `~~x`/`&`) hit the crash validator). See the
+                          // WJH_TRACE=250 note; debug-helper kinds live in the 250+ sentinel range.
   WJH_INSTANCEOFPROTO = 31,  // scratch[0]=obj(value), scratch[1]=proto(object) -> IsPrototypeOf (Boolean); MInstanceOf
   WJH_LAMBDA = 32,           // scratch[0]=envChain(object), scratch[1]=templateFun(object) -> LambdaOptimizedFallback (Object); MLambda
   WJH_TYPEOFIS = 33,         // scratch[0]=operand(value), site=(jstype<<1|invert) -> TypeOfValue==jstype (Boolean); MTypeOfIs
@@ -149,9 +152,27 @@ enum WJHelpKind : int {
   WJH_BINDFUNCTION = 86,     // scratch[0]=target(Object),[1..argc]=bound args (args[0]=boundThis), site=argc -> BoundFunctionObject::functionBindImpl -> Object; MBindFunction (fn.bind); GC(alloc)+throw
   WJH_LOADITERELEM = 87,     // scratch[0]=iterator(PropertyIteratorObject),[1]=index(Int32) -> NativeIterator propertiesBegin()[index].asString() (String); MLoadIteratorElement (Object.keys(o)[i] ScalarReplacement); no GC/throw
   WJH_GETDOMPROP = 88,       // scratch[0]=DOM object(guarded),[1]=JSJitInfo*(baked i32 ptr) -> js::jit::CallDOMGetter -> Value; MGetDOMProperty (DOM getter JSJitGetterOp ABI); GC+throw
+  WJH_REGEXPMATCHER = 89,    // scratch[0]=regexp(Object),[1]=string(String),[2]=lastIndex(Int32) -> Value (match array or null); MRegExpMatcher (js::RegExpMatcherRaw, nullptr matches); GC+throw
+  WJH_REGEXPSEARCHER = 90,   // scratch[0]=regexp(Object),[1]=string(String),[2]=lastIndex(Int32) -> Int32 (match start or -1); MRegExpSearcher (js::RegExpSearcherRaw, nullptr matches); sets cx->regExpSearcherLastLimit; GC+throw
+  WJH_REGEXPSEARCHERLASTLIMIT = 91, // (no operands) -> Int32 (cx->regExpSearcherLastLimit); MRegExpSearcherLastLimit; reads the limit set by the preceding WJH_REGEXPSEARCHER; no GC/throw
+  WJH_REGEXPEXECMATCH = 92,  // scratch[0]=regexp(RegExpObject),[1]=string(String) -> Value (match array or null); MRegExpExecMatch (js::RegExpBuiltinExecMatchFromJit, nullptr matches); GC+throw
+  WJH_REGEXPEXECTEST = 93,   // scratch[0]=regexp(RegExpObject),[1]=string(String) -> Boolean; MRegExpExecTest (js::RegExpBuiltinExecTestFromJit); GC+throw
+  WJH_GETFIRSTDOLLARINDEX = 94, // scratch[0]=string(String) -> Int32 (first '$' index or -1); MGetFirstDollarIndex (js::GetFirstDollarIndexRaw); no throw
+  WJH_INSHAPELISTOFFSET = 95,   // scratch[0]=obj(Object),[1]=shapeList(Object) -> Int32 (matched shape's slot offset, or -1 -> deopt); MGuardMultipleShapesToOffset. List is [shape,offset] pairs.
+  WJH_NEWTYPEDARRFROMBUF = 96,  // scratch[0]=buffer(Object),[1]=byteOffset(Value),[2]=length(Value),[3]=template(Object) -> Object; MNewTypedArrayFromArrayBuffer (js::NewTypedArrayWithTemplateAndBuffer). May throw.
+  WJH_NEWARGUMENTS = 97,        // scratch[0..argc-1]=actuals(Value),[8]=callee(Object),[9]=scopeChain(Object),[10]=argc(Int32) -> Object; MCreateArgumentsObject (ArgumentsObject::createForWasmJit).
+  WJH_OBJCLASSTOSTRING = 98,    // scratch[0]=obj(Object) -> String (js::ObjectClassToString "[object X]") or 0-ptr sentinel (interesting @@toStringTag -> emitted code deopts). No throw.
+  WJH_OPTGETITER = 99,          // scratch[0]=value(Value) -> Boolean; MOptimizeGetIteratorCache (js::OptimizeGetIterator: can this value use the fast for-of/spread iterator?). No throw.
+  WJH_OPTSPREADCALL = 100,      // scratch[0]=value(Value) -> Value (the array to spread, or undefined if not optimizable); MOptimizeSpreadCallCache (js::OptimizeSpreadCall). May GC/throw (arguments-spread path).
+  WJH_REST = 101,               // scratch[0..7]=actuals(boxed), [8]=numFormals, [9]=argc(raw) -> Object; MRest rest-parameter array via js::jit::InitRestParameter (nullptr arrRes -> NewDenseCopiedArray). May GC/OOM.
+  WJH_GETSPARSEELEM = 102,      // scratch[0]=obj(Object), [1]=index(boxed Int32) -> Value; MCallGetSparseElement via js::GetSparseElementHelper. May GC/throw.
+  WJH_NEWNAMEDLAMBDA = 103,     // scratch[0]=callee(function, boxed) -> Object; MNewNamedLambdaObject via js::NamedLambdaObject::createWithoutEnclosing (enclosing set by a later store). May GC/OOM.
+  WJH_NEWVARENV = 104,          // gWJVarScope=VarScope* (raw) -> VarEnvironmentObject::createWithoutEnclosing (Object); MNewVarEnvironmentObject. May GC/OOM.
 };
 // MNewLexicalEnvironmentObject: the LexicalScope* baked from the template object.
 extern uint32_t gWJLexScope;
+// MNewVarEnvironmentObject: the VarScope* baked from the template object.
+extern uint32_t gWJVarScope;
 
 // OSR cheap-resume (GECKO_WJ_OSR): runtime sets these to re-enter a dispatch-loop fn
 // at a loop-head block with locals loaded from gWJResumeVals. Cleared by the prologue.
@@ -268,6 +289,9 @@ extern uint32_t gWJDeoptByOp[];
 extern uint32_t gWJResumeNArgs[];       // per frame
 extern uint32_t gWJResumeNLocals[];     // per frame
 extern uint32_t gWJResumeValsOff[];     // start index into gWJResumeVals, per frame
+extern uint32_t gWJResumeCalleeFn[];    // runtime callee fn* per frame (0 = canonical)
+extern uint32_t gWJLastDeoptOp;         // MIR opcode of the most recent deopt site
+extern const uint32_t gWJOpGuardGlobalGeneration;  // numeric MIR opcode (backend-exported)
 // Call boundary: callee + argc for wjhelp(WJH_CALL).
 extern uint64_t gWJCallCallee;
 extern uint32_t gWJCallSiteLine[];  // DEBUG: caller script line per call site
@@ -326,9 +350,18 @@ static constexpr uint32_t kWJPropWays = 4;
 static constexpr uint32_t kWJPropMissingSentinel = 0xFFFFFFFFu;
 extern uint32_t gWJPropShape[];   // cached receiver Shape* (0 = empty)
 extern uint32_t gWJPropOff[];     // cached TaggedSlotOffset bits ((off<<1)|isFixed)
+// STORE-IC way key: the atom JSString* the way was filled for (0 = empty). The
+// store IC's hit path guards (shape AND key): a SetPropertyCache site with a
+// DYNAMIC key (`obj[k] = v`) sees many keys for one receiver shape, so a
+// shape-only match would store into the OTHER key's cached slot (babylon
+// Node.__clone corrupted every cloned AST node this way). Traced (atoms are GC
+// cells) so the pointer compare stays current across a moving GC.
+extern uint32_t gWJPropWayKey[];
 extern uint32_t gWJAddOldShape[];  // ADD-IC: pool addr of pre-add shape (0 = unset)
 extern uint32_t gWJAddNewShape[];  // ADD-IC: pool addr of post-add shape
 extern uint32_t gWJAddOff[];       // ADD-IC: added prop's fixed-slot byte offset
+extern uint32_t gWJAddKey[];       // ADD-IC: the added key's atom (guarded like
+                                   // gWJPropWayKey; one dynamic site adds MANY keys)
 extern uint32_t gWJPropHolder[];  // proto-read cache: holder object* (0 = OWN-property way;
                                   // nonzero = load the slot from this proto holder instead
                                   // of the receiver). Validated by receiver shape match alone
