@@ -168,6 +168,14 @@ enum WJHelpKind : int {
   WJH_GETSPARSEELEM = 102,      // scratch[0]=obj(Object), [1]=index(boxed Int32) -> Value; MCallGetSparseElement via js::GetSparseElementHelper. May GC/throw.
   WJH_NEWNAMEDLAMBDA = 103,     // scratch[0]=callee(function, boxed) -> Object; MNewNamedLambdaObject via js::NamedLambdaObject::createWithoutEnclosing (enclosing set by a later store). May GC/OOM.
   WJH_NEWVARENV = 104,          // gWJVarScope=VarScope* (raw) -> VarEnvironmentObject::createWithoutEnclosing (Object); MNewVarEnvironmentObject. May GC/OOM.
+  WJH_HASOWN = 105,             // scratch[0]=value/obj(boxed), [1]=idval/key(boxed) -> Boolean; MHasOwnCache via js::HasOwnProperty (`id in obj` / hasOwnProperty). May GC/throw (ToPropertyKey/ToObject).
+  WJH_NEWMAP = 106,             // no operands -> Object; MNewMapObject via js::MapObject::create(cx, nullptr) (default Map.prototype, mirrors Ion OOL). May GC/OOM.
+  WJH_NEWSET = 107,             // no operands -> Object; MNewSetObject via js::SetObject::create(cx, nullptr) (default Set.prototype, mirrors Ion OOL). May GC/OOM.
+  WJH_NEWITERATOR = 108,        // no operands, site=type(0=Array/1=String/2=RegExpString) -> Object; MNewIterator via js::NewArrayIterator/NewStringIterator/NewRegExpStringIterator. for-of/spread iterator. May GC/OOM.
+  WJH_CODEPOINTAT = 109,        // scratch[0]=string(boxed), [1]=index(boxed Int32) -> Int32; MCodePointAt via js::jit::CodePointAt (full code point, combines surrogate pairs). String iteration. May GC (rope flatten).
+  WJH_FROMCODEPOINT = 110,      // scratch[0]=codePoint(boxed Int32, guaranteed 0..0x10FFFF by a JIT deopt-guard) -> String; MFromCodePoint via js::StringFromCodePoint. String.fromCodePoint / string iteration. May GC/OOM.
+  WJH_ISPACKEDARRAY = 111,      // scratch[0]=object(boxed) -> Boolean; MIsPackedArray via js::IsPackedArray (pure read: ArrayObject && initLen==len && packed). Array fast-path checks (spread/Reflect/from). No GC/throw.
+  WJH_GETPROPSUPER = 112,       // scratch[0]=object/super-base(Object), [1]=receiver/this(boxed), [2]=idval/key(boxed) -> Value; MGetPropSuperCache via ToPropertyKey + js::GetProperty(obj,receiver,id) (super.prop / super[expr]). May GC/throw.
 };
 // MNewLexicalEnvironmentObject: the LexicalScope* baked from the template object.
 extern uint32_t gWJLexScope;

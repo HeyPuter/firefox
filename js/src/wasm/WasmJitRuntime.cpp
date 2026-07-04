@@ -32,6 +32,7 @@
 #include "vm/JSFunction.h"
 #include "vm/ArgumentsObject.h"  // ArgumentsObject::createForWasmJit (WJH_NEWARGUMENTS)
 #include "builtin/Object.h"      // js::ObjectClassToString (WJH_OBJCLASSTOSTRING)
+#include "builtin/MapObject.h"   // js::MapObject::create / js::SetObject::create (WJH_NEWMAP/NEWSET)
 #include "jit/JitScript.h"
 #include "jit/VMFunctions.h"  // CreateThisFromIon
 #include "js/experimental/JitInfo.h"  // JSJitGetterOp, JSJitGetterCallArgs (WJH_GETDOMPROP)
@@ -66,6 +67,7 @@
 #include "vm/BoundFunctionObject.h"  // js::BoundFunctionObject::createWithTemplate (NewBoundFunction)
 
 #include "vm/NativeObject-inl.h"
+#include "vm/ObjectOperations-inl.h"  // js::GetProperty(obj,receiver,id) (WJH_GETPROPSUPER)
 #include "vm/PlainObject-inl.h"  // createWithShape
 #include "vm/Interpreter-inl.h"  // GetElementOperation
 #include "vm/JSObject-inl.h"     // GuessArrayGCKind
@@ -185,6 +187,7 @@ uintptr_t gWJStringHeaderWord = 0; // NurseryCellHeader value for String cells (
 uint32_t gWJHelpObj = 0;        // object ptr for WJH_SETSLOT
 uint32_t gWJHelpSlot = 0;
 uint64_t gWJHelpVal = 0;        // boxed value for WJH_SETSLOT
+uint64_t gWJPreBarBadSkips = 0; // WJH_PREBARRIER: count of skipped invalid/garbage old-value cells (a store handed the barrier a bad ptr -- see discord.com pre-barrier crash)
 uint64_t gWJElemHits = 0;       // DEBUG: inline typed-array element-store IC hits
 uint32_t gWJCallFn[kWJCallSites * kWJCallWays];     // polymorphic call IC: callee ptrs
 int32_t gWJCallTblIdx[kWJCallSites * kWJCallWays];  // polymorphic call IC: table slots
@@ -2116,17 +2119,40 @@ static double wjhelpImpl(double kindF, double siteF) {
     JSObject* obj = reinterpret_cast<JSObject*>(uintptr_t(gWJHelpObj));
     // PostWriteBarrier (putWholeCellDontCheckLast) assumes a TENURED container;
     // buffering a nursery cell corrupts the store buffer. Ion inlines this guard.
-    if (obj && obj->isTenured()) {
+    // Validate the container pointer BEFORE obj->isTenured() dereferences it: a
+    // stale/garbage store-container ptr (same class as the [[prebarrier-garbage-crash]]
+    // discord fix) would otherwise crash/corrupt here. IsCellPointerValid checks the
+    // chunk/arena metadata without touching object contents (safe on garbage), and
+    // never false-negatives a real cell -> sound.
+    if (obj && js::gc::IsCellPointerValid(obj) && obj->isTenured()) {
       js::jit::PostWriteBarrier(cx->runtime(), obj);
+    } else if (obj && !js::gc::IsCellPointerValid(obj)) {
+      gWJPreBarBadSkips++;  // shared diagnostic: a store handed a barrier a bad container ptr
     }
     return 0.0;
   }
 
   if (kind == js::wasm::WJH_PREBARRIER) {
     // Incremental-GC pre-write barrier on the OLD value being overwritten. Only
-    // reached when the zone's marking-barrier flag is set (the emitted fast path
-    // skips otherwise), so this is rare. ValuePreWriteBarrier no-ops non-GC values.
-    js::gc::ValuePreWriteBarrier(JS::Value::fromRawBits(gWJHelpVal));
+    // reached when the zone's marking-barrier flag is set (fast path skips otherwise).
+    // ValuePreWriteBarrier only ASSERTS isGCThing (off in release) then traces
+    // v.toGCThing() -- so a NON-GC or GARBAGE-pointer old value flows straight into
+    // TraceEdgeForBarrier -> uncatchable `unreachable` (the discord.com crash: a JIT
+    // store's old-value read yielded a GC-tagged garbage pointer, e.g. a stale object
+    // ptr after a minor GC while incremental marking is active). GUARD it: only trace a
+    // real GC thing whose cell pointer is VALID (in a live GC chunk/arena) -- mirrors
+    // the engine's own defensive skip at gc/Marking-inl.h IsGCThingValidAfterMovingGC.
+    // Skipping an INvalid "cell" is sound (garbage isn't a live edge to preserve) and
+    // never rejects a valid cell (IsCellPointerValid has no false negatives).
+    JS::Value v = JS::Value::fromRawBits(gWJHelpVal);
+    if (v.isGCThing()) {
+      js::gc::Cell* cell = v.toGCThing();
+      if (cell && js::gc::IsCellPointerValid(cell)) {
+        js::gc::ValuePreWriteBarrier(v);
+      } else {
+        gWJPreBarBadSkips++;  // diagnostic: a store handed the barrier a bad old value
+      }
+    }
     return 0.0;
   }
 
@@ -2295,7 +2321,11 @@ static double wjhelpImpl(double kindF, double siteF) {
   // Global/lexical name lookup (MGetNameCache) + IC fill. scratch[0]=env chain
   // object, scratch[1]=name (StringValue atom, baked). site=siteF.
   if (kind == js::wasm::WJH_GETNAME) {
-    uint32_t site = uint32_t(siteF);
+    uint32_t rawSite = uint32_t(siteF);
+    // High bit = typeof context: an unresolved name must yield undefined, not throw
+    // (mirrors the interpreter's GetNameOperation kludge). Low bits = the IC site.
+    bool isTypeofName = (rawSite & 0x80000000u) != 0;
+    uint32_t site = rawSite & 0x7FFFFFFFu;
     static int dbgName = getenv("GECKO_WJ_NAMEDBG") ? 1 : 0;
     if (dbgName) {
       static uint64_t calls = 0, fills = 0;
@@ -2348,10 +2378,14 @@ static double wjhelpImpl(double kindF, double siteF) {
         return 0.0;
       }
     }
-    // Slow path (proxies / accessors / not found): no caching.
+    // Slow path (proxies / accessors / not found): no caching. Under typeof, use
+    // TypeOf mode so an unresolved name returns undefined instead of throwing
+    // ReferenceError (real-site feature detection: `typeof window`, etc.).
     RootedValue res(cx);
-    if (!js::GetEnvironmentName<js::GetNameMode::Normal>(cx, env, name, &res))
-      return 1.0;
+    bool ok = isTypeofName
+                  ? js::GetEnvironmentName<js::GetNameMode::TypeOf>(cx, env, name, &res)
+                  : js::GetEnvironmentName<js::GetNameMode::Normal>(cx, env, name, &res);
+    if (!ok) return 1.0;
     gWJScratch[js::wasm::kWJResultSlot] = res.asRawBits();
     return 0.0;
   }
@@ -2774,6 +2808,101 @@ static double wjhelpImpl(double kindF, double siteF) {
     JS::Value v = JS::Value::fromRawBits(gWJScratch[0]);
     bool res = js::OptimizeGetIterator(v, cx);
     gWJScratch[js::wasm::kWJResultSlot] = JS::BooleanValue(res).asRawBits();
+    return 0.0;
+  }
+
+  if (kind == js::wasm::WJH_HASOWN) {
+    // MHasOwnCache: `id in obj` / obj.hasOwnProperty(id) fast path. Operand order
+    // matches DoHasOwnFallback's HasOwnProperty(cx, objValue, keyValue): value()=obj
+    // in [0], idval()=key in [1] (both GC-traced boxed slots). May GC/throw
+    // (ToPropertyKey / ToObject on a non-object value). Result Boolean.
+    JS::RootedValue val(cx, JS::Value::fromRawBits(gWJScratch[0]));
+    JS::RootedValue idval(cx, JS::Value::fromRawBits(gWJScratch[1]));
+    bool res;
+    if (!js::HasOwnProperty(cx, val, idval, &res)) return 1.0;  // threw
+    gWJScratch[js::wasm::kWJResultSlot] = JS::BooleanValue(res).asRawBits();
+    return 0.0;
+  }
+
+  if (kind == js::wasm::WJH_NEWMAP) {
+    // MNewMapObject: `new Map()`. Cold alloc (Map's internal hashtable) -> VM call,
+    // nullptr proto = default Map.prototype (mirrors Ion's visitNewMapObject OOL).
+    js::MapObject* m = js::MapObject::create(cx, nullptr);
+    if (!m) return 1.0;
+    gWJScratch[js::wasm::kWJResultSlot] = JS::ObjectValue(*m).asRawBits();
+    return 0.0;
+  }
+
+  if (kind == js::wasm::WJH_NEWSET) {
+    // MNewSetObject: `new Set()`. Same pattern as WJH_NEWMAP.
+    js::SetObject* s = js::SetObject::create(cx, nullptr);
+    if (!s) return 1.0;
+    gWJScratch[js::wasm::kWJResultSlot] = JS::ObjectValue(*s).asRawBits();
+    return 0.0;
+  }
+
+  if (kind == js::wasm::WJH_NEWITERATOR) {
+    // MNewIterator: for-of / spread iterator object. site selects the type
+    // (0=ArrayIterator, 1=StringIterator, 2=RegExpStringIterator), matching
+    // Ion's visitNewIterator OOL VM calls. Cold alloc -> VM call.
+    JSObject* it = nullptr;
+    switch (int(siteF)) {
+      case 0: it = js::NewArrayIterator(cx); break;
+      case 1: it = js::NewStringIterator(cx); break;
+      case 2: it = js::NewRegExpStringIterator(cx); break;
+      default: return 1.0;
+    }
+    if (!it) return 1.0;
+    gWJScratch[js::wasm::kWJResultSlot] = JS::ObjectValue(*it).asRawBits();
+    return 0.0;
+  }
+
+  if (kind == js::wasm::WJH_CODEPOINTAT) {
+    // MCodePointAt: str.codePointAt(index) -> full Unicode code point (combines a
+    // high+low surrogate pair). VM fn (Ion's OOL fallback); may GC (rope flatten).
+    JS::RootedString str(cx, JS::Value::fromRawBits(gWJScratch[0]).toString());
+    int32_t index = JS::Value::fromRawBits(gWJScratch[1]).toInt32();
+    uint32_t out;
+    if (!js::jit::CodePointAt(cx, str, index, &out)) return 1.0;
+    gWJScratch[js::wasm::kWJResultSlot] = JS::Int32Value(int32_t(out)).asRawBits();
+    return 0.0;
+  }
+
+  if (kind == js::wasm::WJH_FROMCODEPOINT) {
+    // MFromCodePoint: String.fromCodePoint(cp). The JIT deopt-guards cp to
+    // [0, NonBMPMax] before calling, so StringFromCodePoint's MOZ_ASSERT holds
+    // (invalid code points route to PBL, which throws RangeError). May GC/OOM.
+    int32_t cp = JS::Value::fromRawBits(gWJScratch[0]).toInt32();
+    JSLinearString* s = js::StringFromCodePoint(cx, char32_t(cp));
+    if (!s) return 1.0;
+    gWJScratch[js::wasm::kWJResultSlot] = JS::StringValue(s).asRawBits();
+    return 0.0;
+  }
+
+  if (kind == js::wasm::WJH_ISPACKEDARRAY) {
+    // MIsPackedArray: obj is a dense, hole-free ArrayObject? Pure read (no GC/throw);
+    // js::IsPackedArray handles non-array objects (returns false). Result Boolean.
+    JSObject* obj = &JS::Value::fromRawBits(gWJScratch[0]).toObject();
+    gWJScratch[js::wasm::kWJResultSlot] =
+        JS::BooleanValue(js::IsPackedArray(obj)).asRawBits();
+    return 0.0;
+  }
+
+  if (kind == js::wasm::WJH_GETPROPSUPER) {
+    // MGetPropSuperCache: `super.prop` / `super[expr]`. Read `id` off the super base
+    // `object` but invoke getters with `receiver` (this) -- js::GetProperty's
+    // receiver overload does exactly that. object may be null (e.g. `extends null`)
+    // -> ToObject throws TypeError, matching spec. May GC/throw.
+    JS::RootedValue objVal(cx, JS::Value::fromRawBits(gWJScratch[0]));
+    JS::RootedValue receiver(cx, JS::Value::fromRawBits(gWJScratch[1]));
+    JS::RootedValue idval(cx, JS::Value::fromRawBits(gWJScratch[2]));
+    JS::RootedObject obj(cx, JS::ToObject(cx, objVal));  // null super base -> TypeError
+    if (!obj) return 1.0;
+    JS::RootedId id(cx);
+    if (!ToPropertyKey(cx, idval, &id)) return 1.0;
+    JS::RootedValue res(cx);
+    if (!js::GetProperty(cx, obj, receiver, id, &res)) return 1.0;
+    gWJScratch[js::wasm::kWJResultSlot] = res.get().asRawBits();
     return 0.0;
   }
 
@@ -3311,6 +3440,15 @@ static double wjhelpImpl(double kindF, double siteF) {
         return 0.0;
       }
     }
+    // A receiver whose CLASS has a RESOLVE HOOK may have an UNRESOLVED OWN property
+    // that lookupPure (pure = no resolve) missed above -- e.g. a JSFunction's lazy
+    // `name`/`length` (fun_resolve). That own property would SHADOW any proto prop,
+    // so the proto/missing caches below are UNSOUND here (they'd return the proto's
+    // value, e.g. Function.prototype.name="" for `fn.name` on an un-accessed fn ->
+    // chai getFuncName miscompile). Skip them -> fall to the resolving
+    // GetElementOperation, which runs the resolve hook and reads the real own prop.
+    bool recvHasResolveHook =
+        objv.isObject() && objv.toObject().getClass()->getResolve() != nullptr;
     // PROTO-DATA cache: the property isn't OWN, but if it's a plain DATA property on
     // a native object in the proto chain (richards' `.run` method lookup, 798K/run),
     // cache (receiverShape -> holder + holder's tagged slot offset). A receiver-shape
@@ -3318,7 +3456,7 @@ static double wjhelpImpl(double kindF, double siteF) {
     // shadow, the holder's existing-prop slot offset is stable, and the value is
     // loaded fresh. Holder ptr is traced. GECKO_WJ_NOPROTOIC disables.
     static int noProtoIC = getenv("GECKO_WJ_NOPROTOIC") ? 1 : 0;
-    if (!noProtoIC && objv.isObject() &&
+    if (!noProtoIC && !recvHasResolveHook && objv.isObject() &&
         objv.toObject().is<js::NativeObject>()) {
       js::NativeObject* recv = &objv.toObject().as<js::NativeObject>();
       for (JSObject* p = recv->staticPrototype(); p && p->is<js::NativeObject>();
@@ -3364,6 +3502,13 @@ static double wjhelpImpl(double kindF, double siteF) {
       bool allNativeMissing = true;
       for (JSObject* p = &objv.toObject(); p; p = p->staticPrototype()) {
         if (!p->is<js::NativeObject>()) { allNativeMissing = false; break; }
+        // A class RESOLVE HOOK can lazily materialize a property that lookupPure
+        // (pure = no resolve) does NOT see -- e.g. a JSFunction's lazy `name`/
+        // `length` (fun_resolve). Treating such as "missing" cached undefined for
+        // `fn.name` on an un-accessed function (chai getFuncName miscompile). If any
+        // object in the chain has a resolve hook, don't conclude missing -> fall to
+        // the resolving GetElementOperation below.
+        if (p->getClass()->getResolve()) { allNativeMissing = false; break; }
         if (p->as<js::NativeObject>().lookupPure(id).isSome()) {
           allNativeMissing = false;
           break;
