@@ -247,6 +247,18 @@ extern uint32_t gWJEmitTotalDeopts;
 extern bool gWJForceMega;  // next compile: megamorphic property reads (post-storm)
 extern bool gWJForceNumberArith;  // next compile: de-speculate Int32 arith/elem ICs (post-deopt)
 
+// Synchronous main-thread tier-up compile cost (GECKO_WJ_COMPILESTAT).
+extern uint64_t gWJCompileAttempts;  // total WJWarpCompile calls
+extern uint64_t gWJCompileOK;        // compiles that succeeded (handle >= 0)
+extern double gWJCompileMs;          // wall-ms across ALL attempts (incl bails)
+extern double gWJCompileOKMs;        // wall-ms across successful compiles only
+extern double gWJHostCompileMs;      // wall-ms in wasmhost_compile (V8 wasm compile)
+extern double gWJHostInstMs;         // wall-ms in wasmhost_instantiate
+extern uint64_t gWJEmitBytes;        // total emitted wasm bytes across compiles
+extern double gWJSnapshotMs;         // wall-ms in WarpOracle::createSnapshot
+extern double gWJBuildMs;            // wall-ms in WarpBuilder::build
+extern double gWJOptimizeMs;         // wall-ms in OptimizeMIR
+
 // Compile bail-reason tracking (GECKO_WJ_CDBG): the most recent reason a function
 // stayed in PBL plus its source line, printed by WJWarpCompile when WJEmitBody
 // returns false. gWJBailReason points to a string literal (no ownership).

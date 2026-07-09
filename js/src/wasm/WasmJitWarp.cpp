@@ -11,6 +11,7 @@
 // and host-compiles + instantiates it. Returns a host handle (or -1).
 
 #include "mozilla/ScopeExit.h"
+#include "mozilla/TimeStamp.h"  // GECKO_WJ_COMPILESTAT split compile timing
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -253,7 +254,15 @@ static int AssembleAndInstall(MIRGenerator& mirGen, MIRGraph& graph,
     }
   }
 
+  static int compileStat = getenv("GECKO_WJ_COMPILESTAT") ? 1 : 0;
+  mozilla::TimeStamp hostT0;
+  if (compileStat) hostT0 = mozilla::TimeStamp::Now();
   int handle = wasmhost_compile(out.begin(), int(out.length()));
+  if (compileStat) {
+    js::wasm::gWJHostCompileMs +=
+        (mozilla::TimeStamp::Now() - hostT0).ToMilliseconds();
+    js::wasm::gWJEmitBytes += uint64_t(out.length());
+  }
   if (handle < 0) {
     // The host (V8) REJECTED the emitted wasm module -- our codegen produced
     // invalid/oversized wasm for this function. This is NOT an unsupported-node
@@ -268,7 +277,14 @@ static int AssembleAndInstall(MIRGenerator& mirGen, MIRGraph& graph,
     return -1;
   }
   const int importIds[3] = {-3, memId, tblId};  // help (shim), mem, tbl
-  if (wasmhost_instantiate(handle, importIds, 3) != 0) {
+  mozilla::TimeStamp instT0;
+  if (compileStat) instT0 = mozilla::TimeStamp::Now();
+  int instRes = wasmhost_instantiate(handle, importIds, 3);
+  if (compileStat) {
+    js::wasm::gWJHostInstMs +=
+        (mozilla::TimeStamp::Now() - instT0).ToMilliseconds();
+  }
+  if (instRes != 0) {
     js::wasm::gWJBailReason = "host-instantiate-fail";
     return -1;
   }
@@ -418,23 +434,41 @@ int WJWarpCompile(JSContext* cx, JSScript* script, uint32_t* nargsOut,
   MIRGenerator mirGen(CompileRealm::get(cx->realm()), options, &temp, &graph,
                       info, optimizationInfo);
 
+  static int compileStatP = getenv("GECKO_WJ_COMPILESTAT") ? 1 : 0;
   WarpSnapshot* snapshot = nullptr;
   {
     gc::AutoSuppressGC suppressGC(cx);
+    mozilla::TimeStamp t0;
+    if (compileStatP) t0 = mozilla::TimeStamp::Now();
     WarpOracle oracle(cx, mirGen, scriptRoot);
     AbortReasonOr<WarpSnapshot*> result = oracle.createSnapshot();
     if (result.isErr()) return -1;
     snapshot = result.unwrap();
+    if (compileStatP)
+      js::wasm::gWJSnapshotMs += (mozilla::TimeStamp::Now() - t0).ToMilliseconds();
   }
   {
     gc::AutoSuppressGC suppressGC(cx);
+    mozilla::TimeStamp t0;
+    if (compileStatP) t0 = mozilla::TimeStamp::Now();
     WarpCompilation comp(mirGen.alloc());
     WarpBuilder builder(*snapshot, mirGen, &comp);
     if (!builder.build()) return -1;
+    if (compileStatP)
+      js::wasm::gWJBuildMs += (mozilla::TimeStamp::Now() - t0).ToMilliseconds();
   }
   {
     gc::AutoSuppressGC suppressGC(cx);
+    mozilla::TimeStamp t0;
+    if (compileStatP) t0 = mozilla::TimeStamp::Now();
+    // NB: disabling GVN/LICM/RangeAnalysis here to cut OptimizeMIR time (~19% of
+    // tier-up compile) is a NET LOSS -- measured: the un-optimized graph has more
+    // instructions, so emit + host-compile (which scale with graph/output size) grow
+    // MORE than OptimizeMIR shrinks (per-compile 1.96ms -> 2.27ms). The optimizer
+    // pays for itself by shrinking the graph. So run the full Normal pipeline.
     if (!OptimizeMIR(&mirGen)) return -1;
+    if (compileStatP)
+      js::wasm::gWJOptimizeMs += (mozilla::TimeStamp::Now() - t0).ToMilliseconds();
   }
   if (dump) {
     fprintf(stderr, "[wb-compile] %s:%u optimized, %u blocks\n",

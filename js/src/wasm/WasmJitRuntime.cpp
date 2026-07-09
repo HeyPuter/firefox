@@ -10,6 +10,7 @@
 // trampolines, and GC root tracing of the scratch buffer.
 
 #include "mozilla/ScopeExit.h"
+#include "mozilla/TimeStamp.h"  // GECKO_WJ_COMPILESTAT tier-up compile cost
 
 #include "wasm/WasmJit.h"
 #include "wasm/WasmJitBackend.h"  // kWJResultSlot / kWJThisSlot / kWJScratchSlots
@@ -171,6 +172,16 @@ uint32_t gWJEmitShapeDeopts = 0;   // last compile: # GuardShape-family deopt si
 uint32_t gWJEmitTotalDeopts = 0;   // last compile: # total deopt sites
 bool gWJForceMega = false;         // megamorphic recompile (set per-compile by the valve)
 bool gWJForceNumberArith = false;  // de-speculate Int32 arith/elem (set per-compile by the valve)
+uint64_t gWJCompileAttempts = 0;
+uint64_t gWJCompileOK = 0;
+double gWJCompileMs = 0.0;
+double gWJCompileOKMs = 0.0;
+double gWJHostCompileMs = 0.0;
+double gWJHostInstMs = 0.0;
+uint64_t gWJEmitBytes = 0;
+double gWJSnapshotMs = 0.0;
+double gWJBuildMs = 0.0;
+double gWJOptimizeMs = 0.0;
 const char* gWJBailReason = "unknown";  // why the last WJEmitBody returned false
 uint32_t gWJBailLine = 0;          // source line of the last bailed function
 uint32_t gWJBailOpLine = 0;        // source line of the specific bailed op
@@ -550,8 +561,43 @@ bool js::wasm::WasmJitObserveCall(JSScript* script) {
   int tblSlot = e.tblSlot;
   js::wasm::gWJForceMega = e.forceMega;  // megamorphic recompile (post-storm)
   gWJPendingOsrTargets.clear();  // backend appends OSR targets during this compile
+  // COMPILE-COST instrumentation (GECKO_WJ_COMPILESTAT): synchronous main-thread
+  // tier-up compile is on the load critical path -- a real-site load compiles
+  // MANY briefly-run functions and NEVER amortizes the compile (unlike octane's
+  // hot loops). Measure count + wall-ms + attempts-that-bail to test whether the
+  // compile itself is the "JIT slower to LOAD real sites" cost.
+  static int compileStat = getenv("GECKO_WJ_COMPILESTAT") ? 1 : 0;
+  mozilla::TimeStamp wjCompT0;
+  if (compileStat) wjCompT0 = mozilla::TimeStamp::Now();
   int handle = js::wasm::WJWarpCompile(cx, script, &nargs, &nlocals, &tblSlot);
   js::wasm::gWJForceMega = false;
+  if (compileStat) {
+    double ms = (mozilla::TimeStamp::Now() - wjCompT0).ToMilliseconds();
+    js::wasm::gWJCompileAttempts++;
+    js::wasm::gWJCompileMs += ms;
+    if (handle >= 0) {
+      js::wasm::gWJCompileOK++;
+      js::wasm::gWJCompileOKMs += ms;
+    }
+    if ((js::wasm::gWJCompileAttempts % 25) == 0) {
+      double emitMs = js::wasm::gWJCompileMs - js::wasm::gWJSnapshotMs -
+                      js::wasm::gWJBuildMs - js::wasm::gWJOptimizeMs -
+                      js::wasm::gWJHostCompileMs - js::wasm::gWJHostInstMs;
+      fprintf(stderr,
+              "[wj-compilestat] attempts=%llu ok=%llu totalMs=%.1f | "
+              "snapshot=%.1f build=%.1f optimize=%.1f emit=%.1f "
+              "hostCompile=%.1f hostInst=%.1f | bytes=%lluK (avg-ok=%.2fms)\n",
+              (unsigned long long)js::wasm::gWJCompileAttempts,
+              (unsigned long long)js::wasm::gWJCompileOK,
+              js::wasm::gWJCompileMs, js::wasm::gWJSnapshotMs,
+              js::wasm::gWJBuildMs, js::wasm::gWJOptimizeMs, emitMs,
+              js::wasm::gWJHostCompileMs, js::wasm::gWJHostInstMs,
+              (unsigned long long)(js::wasm::gWJEmitBytes / 1024),
+              js::wasm::gWJCompileOK
+                  ? js::wasm::gWJCompileOKMs / double(js::wasm::gWJCompileOK)
+                  : 0.0);
+    }
+  }
   if (e.forceMega && getenv("GECKO_WJ_MEGADBG")) {
     fprintf(stderr, "[wj-mega-compile] %s:%u handle=%d\n",
             script->filename() ? script->filename() : "?",
