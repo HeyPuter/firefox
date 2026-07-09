@@ -34,6 +34,12 @@ namespace wasm {
 // the call through WasmJitRunCall); false to keep running in the interpreter.
 extern bool WasmJitObserveCall(JSScript* script);
 
+// Compile any functions that crossed the warmup threshold while GECKO_WJ_DEFERCOMPILE
+// deferred their (synchronous) compile off the critical path. Call at an idle / task
+// boundary (browser: between event-loop tasks; node: between top-level runs). No-op
+// unless deferral queued something.
+extern void WasmJitDrainDeferred();
+
 // Run the installed wasm for `script`. Returns 1 if it handled the call (result
 // in *retBits), 0 to fall back to the interpreter.
 extern int WasmJitRunCall(JSScript* script, uint64_t thisBits,

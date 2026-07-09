@@ -404,10 +404,22 @@ struct WJEntry {
   // OSR-able loop head, recorded at compile time (GECKO_WJ_OSR). A single-frame
   // deopt landing at one of these pcs re-enters the JIT there instead of PBL.
   std::vector<std::pair<uint32_t, uint32_t>> osrTargets;
+  // DEFERRED COMPILE (GECKO_WJ_DEFERCOMPILE): true while this script sits in the
+  // pending-compile queue (crossed the warmup threshold but not yet compiled).
+  bool queued = false;
 };
 
 // Per-script compile state. Keyed by JSScript*; entries persist for the process.
 static std::unordered_map<JSScript*, WJEntry>* gEntries = nullptr;
+
+// DEFERRED-COMPILE queue: scripts that crossed the warmup threshold but whose
+// synchronous compile was deferred OFF the current (load) critical path. Drained by
+// WasmJitDrainDeferred() at an idle / task boundary (the embed calls it). GC-traced
+// in WJTraceRoots so queued scripts stay live + relocated across the defer window.
+static std::vector<JSScript*> gWJDeferQueue;
+// True while draining: makes WasmJitObserveCall skip the enqueue path and compile
+// inline (the drain reuses the same observe->compile logic without re-deferring).
+static bool gWJDrainingNow = false;
 
 static WJEntry& EntryFor(JSScript* script) {
   if (!gEntries) gEntries = new std::unordered_map<JSScript*, WJEntry>();
@@ -505,7 +517,29 @@ bool js::wasm::WasmJitObserveCall(JSScript* script) {
   if (e.state == WJEntry::State::Compiled) return true;
   if (e.state == WJEntry::State::Failed) return false;
 
-  if (e.nextTry == 0) e.nextTry = WarmupDelay();
+  // Size-scaled warmup: the per-function wasm COMPILE cost scales with bytecode
+  // length (big parser/framework fns cost 10-25ms to compile; tiny hot loops <1ms).
+  // A compile only pays off after enough REMAINING runs to amortize it, and
+  // break-even runs scale with the compile cost -> with length. A flat threshold
+  // makes a compile-heavy one-shot LOAD (acorn/marked parse, a site's bundle)
+  // compile many big fns that never amortize -- measured JIT one-shot 1.85x (acorn)
+  // to 5.1x (marked) SLOWER than PBL, while throughput is 1.4-2x FASTER. Scale the
+  // threshold by length so big fns need far more evidence of hotness before paying
+  // their large compile; small hot loops (octane) still tier up early. Applied to
+  // the call-count (nextTry) gate ONLY (see below). GECKO_WJ_SIZEWARMUP=K sets the
+  // per-byte term; DEFAULT 0 (OFF/flat) -- measured, it is a genuine LOAD-vs-
+  // THROUGHPUT TRADEOFF, not a clean win: K=6 improved a one-shot LOAD ~30% (acorn
+  // 2169->1500ms, marked 3041->2196ms) but regressed repeated-execution THROUGHPUT
+  // ~20-35% (marked 48->65ms) because medium hot fns tier up later. The real fix is
+  // DEFERRED/IDLE compilation (compile off the load critical path), which needs a
+  // main-thread-idle hook the embed lacks. Knob kept for load-optimized deployments.
+  static uint32_t sizeK = 0xffffffffu;
+  if (sizeK == 0xffffffffu) {
+    const char* s = getenv("GECKO_WJ_SIZEWARMUP");
+    sizeK = s ? uint32_t(atoi(s)) : 0;
+  }
+  uint32_t lenScale = sizeK * script->length();
+  if (e.nextTry == 0) e.nextTry = WarmupDelay() + lenScale;
   // Trigger on EITHER call count (our observes) OR the script's loop-aware
   // warmUpCount (PBL bumps it on every LoopHead). The latter catches the hot
   // driver functions that are entered rarely but loop thousands of times
@@ -532,6 +566,11 @@ bool js::wasm::WasmJitObserveCall(JSScript* script) {
               unsigned(script->lineno()), int(e.state), e.observes, e.nextTry, warm,
               kLoopWarm, e.fails, unsigned(script->length()));
   }
+  // Scale ONLY the call-count gate by size, NOT the loop-warm gate: a genuinely
+  // hot function (high warmUpCount from internal LoopHeads) should still tier up
+  // promptly regardless of size (that is where the JIT win is + preserves octane/
+  // throughput). Deferring only applies to functions that are merely CALLED a lot
+  // without looping hot -- the parser-dispatch pattern a one-shot load hits.
   if (e.observes < e.nextTry && warm < kLoopWarm) return false;
 
   // NOCOMPILE-lineno-range bisection (GECKO_WJ_NOCOMPILERANGE=lo,hi): refuse to
@@ -552,6 +591,28 @@ bool js::wasm::WasmJitObserveCall(JSScript* script) {
     if (ln >= uint32_t(nclo) && ln <= uint32_t(nchi)) { e.state = WJEntry::State::Failed; return false; }
   }
 
+  // DEFERRED COMPILE: the function crossed the warmup threshold, but compiling it
+  // SYNCHRONOUSLY here blocks the currently-executing task (a page LOAD compiles
+  // many briefly-run fns => the compile is pure critical-path cost that never
+  // amortizes; measured node one-shot 1.85-5.1x slower than PBL). Instead, enqueue
+  // and stay in PBL; WasmJitDrainDeferred() (called by the embed at an idle / task
+  // boundary) compiles queued fns OFF the critical path. A one-shot LOAD then runs
+  // entirely in PBL (fast); repeated execution drains between tasks so hot fns still
+  // get JIT'd (throughput preserved). Only defer the FIRST compile decision (fails==0,
+  // not draining) -- retries after a bail and drain-time compiles go inline.
+  static int deferCompile = getenv("GECKO_WJ_DEFERCOMPILE") ? 1 : 0;
+  if (deferCompile && !gWJDrainingNow && e.fails == 0 &&
+      e.state == WJEntry::State::Cold) {
+    // Enqueue on first qualification; on EVERY later observe stay in PBL (return
+    // false) until the drain compiles it -- otherwise the 2nd observe would fall
+    // through to the inline compile and defeat the deferral.
+    if (!e.queued) {
+      e.queued = true;
+      gWJDeferQueue.push_back(script);
+    }
+    return false;
+  }
+
   JSContext* cx = js::TlsContext.get();
   if (!cx) return false;
   uint32_t nargs = 0, nlocals = 0;
@@ -566,13 +627,20 @@ bool js::wasm::WasmJitObserveCall(JSScript* script) {
   // MANY briefly-run functions and NEVER amortizes the compile (unlike octane's
   // hot loops). Measure count + wall-ms + attempts-that-bail to test whether the
   // compile itself is the "JIT slower to LOAD real sites" cost.
-  static int compileStat = getenv("GECKO_WJ_COMPILESTAT") ? 1 : 0;
+  static int compileStat =
+      getenv("GECKO_WJ_COMPILESTAT") ? atoi(getenv("GECKO_WJ_COMPILESTAT")) : 0;
   mozilla::TimeStamp wjCompT0;
   if (compileStat) wjCompT0 = mozilla::TimeStamp::Now();
   int handle = js::wasm::WJWarpCompile(cx, script, &nargs, &nlocals, &tblSlot);
   js::wasm::gWJForceMega = false;
   if (compileStat) {
     double ms = (mozilla::TimeStamp::Now() - wjCompT0).ToMilliseconds();
+    // Per-compile (bytecode-length, ms) log to test emit super-linearity:
+    // GECKO_WJ_COMPILESTAT=2 prints every compile's script length + wall-ms.
+    if (compileStat >= 2 && handle >= 0) {
+      fprintf(stderr, "[wj-percompile] len=%u ms=%.2f\n",
+              unsigned(script->length()), ms);
+    }
     js::wasm::gWJCompileAttempts++;
     js::wasm::gWJCompileMs += ms;
     if (handle >= 0) {
@@ -635,7 +703,28 @@ bool js::wasm::WasmJitObserveCall(JSScript* script) {
       fflush(stderr);
       MOZ_CRASH("WJ compile bail with GECKO_WJ_FAILONBAIL");
     }
-    if (++e.fails >= 8) {
+    // Permanent-bail short-circuit: a bail whose cause is STRUCTURAL (the function's
+    // bytecode / arg count / control-flow can't change) produces the identical bail
+    // on every retry -- each retry burns a full snapshot+build+optimize(+emit) on the
+    // load critical path for nothing. Measured on a real workload: 80 failed compile
+    // attempts were only 12 unique functions (~6.7 wasted retries each), and EVERY
+    // reason was permanent (reloop-bail / too-many-args / host-compile-reject), zero
+    // transient cold-IC. So cap retries per-reason: structural = give up at once;
+    // host-compile-reject (our codegen emitted invalid wasm, ~always deterministic) =
+    // cap low; everything else (possibly a cold IC that warms up) keeps the full 8.
+    // GECKO_WJ_NOPERMBAIL restores the flat 8-retry behavior.
+    static int noPermBail = getenv("GECKO_WJ_NOPERMBAIL") ? 1 : 0;
+    uint32_t cap = 8;
+    if (!noPermBail && reason) {
+      if (strcmp(reason, "reloop-bail") == 0 ||
+          strcmp(reason, "too-many-args") == 0 ||
+          strcmp(reason, "trycatch") == 0) {
+        cap = 1;
+      } else if (strcmp(reason, "host-compile-reject") == 0) {
+        cap = 2;
+      }
+    }
+    if (++e.fails >= cap) {
       e.state = WJEntry::State::Failed;
     } else {
       e.nextTry = e.observes + (WarmupDelay() << e.fails);
@@ -672,6 +761,45 @@ bool js::wasm::WasmJitObserveCall(JSScript* script) {
             script->filename() ? script->filename() : "?",
             unsigned(script->lineno()), e.directIdx);
   return true;
+}
+
+// Drain the deferred-compile queue: compile every script that crossed the warmup
+// threshold while GECKO_WJ_DEFERCOMPILE deferred it. The embed calls this at an
+// idle / task boundary (browser event loop between tasks; node between top-level
+// runs) so the compiles happen OFF the load critical path. Reuses WasmJitObserveCall
+// with gWJDrainingNow set, so the queued script takes the (already-qualified) inline
+// compile path instead of re-deferring. Bounded per-call by GECKO_WJ_DRAINBUDGET
+// (0 = all) so a huge backlog doesn't stall one idle slot.
+void js::wasm::WasmJitDrainDeferred() {
+  if (gWJDeferQueue.empty() || gWJDrainingNow) return;
+  static uint32_t budget = 0xffffffffu;
+  if (budget == 0xffffffffu) {
+    const char* s = getenv("GECKO_WJ_DRAINBUDGET");
+    budget = s ? uint32_t(atoi(s)) : 0;  // 0 => drain the whole queue each call
+  }
+  gWJDrainingNow = true;
+  uint32_t done = 0;
+  size_t i = 0;
+  for (; i < gWJDeferQueue.size(); i++) {
+    if (budget && done >= budget) break;
+    JSScript* s = gWJDeferQueue[i];
+    WJEntry& e = EntryFor(s);
+    e.queued = false;
+    if (e.state == WJEntry::State::Cold) {
+      WasmJitObserveCall(s);  // qualified already -> compiles inline now
+      done++;
+    }
+  }
+  // Remove the drained prefix; keep any remainder (budget-limited) for next drain.
+  if (i >= gWJDeferQueue.size()) {
+    gWJDeferQueue.clear();
+  } else {
+    gWJDeferQueue.erase(gWJDeferQueue.begin(), gWJDeferQueue.begin() + i);
+  }
+  gWJDrainingNow = false;
+  if (getenv("GECKO_WJ_DEFERDBG"))
+    fprintf(stderr, "[wj-drain] compiled=%u remaining=%zu\n", done,
+            gWJDeferQueue.size());
 }
 
 // Set during the differential verifier's interpreter re-run so nested calls
@@ -4382,6 +4510,11 @@ extern "C" EMSCRIPTEN_KEEPALIVE void WJTraceRoots(JSTracer* trc, void*) {
   for (uint32_t i = 0; i <= js::wasm::kWJThisSlot; i++) {
     WJDbgLogRoot(trc, "scratch", i, &gWJScratch[i]);
     JS::TraceRoot(trc, reinterpret_cast<JS::Value*>(&gWJScratch[i]), "wjscratch");
+  }
+  // Deferred-compile queue: keep queued scripts live + pointer-current across the
+  // defer window (enqueue in one task, drain at a later idle/task boundary).
+  for (JSScript*& s : gWJDeferQueue) {
+    js::TraceRoot(trc, &s, "wjdeferq");
   }
   for (uint32_t i = 0; i < gWJConstPoolCount; i++) {
     WJDbgLogRoot(trc, "const", i, &gWJConstPool[i]);
