@@ -335,6 +335,15 @@ int WJWarpCompile(JSContext* cx, JSScript* script, uint32_t* nargsOut,
       }
     }
   }
+  // Enter the SCRIPT's realm for the whole compile. The inline tier-up path is
+  // already in it (the fn is executing), but the DEFERRED-compile drain
+  // (WasmJitDrainDeferred, called from the embed's idle loop with no JS on the
+  // stack) is NOT -- and the rest of this function reads cx->realm()/cx->global()
+  // (CompileRealm, global lexical env, nursery alloc site). Compiling in the wrong
+  // realm built the snapshot/MIR against the wrong global -> browser crash after an
+  // idle drain (defer-on correctness sweep died mid-run). Re-entering the same realm
+  // on the inline path is cheap + safe. (Nested AutoRealms below are harmless.)
+  AutoRealm ar(cx, script);
   // Bake the zone's needs-marking-barrier flag address for the emitted pre-write
   // barrier fast path (single-zone shell -> one stable address).
   js::wasm::gWJMarkBarrierAddr =

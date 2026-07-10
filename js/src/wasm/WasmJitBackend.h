@@ -255,6 +255,7 @@ extern double gWJCompileOKMs;        // wall-ms across successful compiles only
 extern double gWJHostCompileMs;      // wall-ms in wasmhost_compile (V8 wasm compile)
 extern double gWJHostInstMs;         // wall-ms in wasmhost_instantiate
 extern uint64_t gWJEmitBytes;        // total emitted wasm bytes across compiles
+extern int64_t gWJTraceVal;          // per-def value tracer staging (GECKO_WJ_VALUETRACE)
 extern double gWJSnapshotMs;         // wall-ms in WarpOracle::createSnapshot
 extern double gWJBuildMs;            // wall-ms in WarpBuilder::build
 extern double gWJOptimizeMs;         // wall-ms in OptimizeMIR

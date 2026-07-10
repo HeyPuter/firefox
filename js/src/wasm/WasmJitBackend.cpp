@@ -340,6 +340,15 @@ struct WJBackend {
                                   // body -- deopt-resume into a reloop'd switch is the
                                   // unfixed #16 miscompile, so ops that would add a NEW
                                   // deopt site here must bail the whole fn to PBL.
+  bool selfBoundSwitch = false;   // switch-in-loop-with-ArrayPush fn: the ROOT of the #16
+                                  // miscompile is a spurious hoisted-BoundsCheck boundary
+                                  // deopt whose RESUME corrupts the result (the steady-
+                                  // state switch-merge codegen is CORRECT -- proven by the
+                                  // padded-buffer test). Rather than bail whole-fn to PBL,
+                                  // emit these deopt-free: clamp hoisted BoundsChecks to
+                                  // guard only the base index (buf[i]) + self-bound the
+                                  // unguarded in-case loads (buf[i+1]) -> no boundary deopt
+                                  // -> no broken resume. See [[cf-challenge-reloop-root-cause]].
   uint32_t bodyLoopIdx = 0;       // br-index of loop $L from the current body base
   bool reloopHasCalls = false;    // caller hint: the function makes calls (-> use OOL
                                   // deopt in the relooper to keep call-heavy bodies lean)
@@ -452,6 +461,9 @@ static bool GetOp(Encoder& e, WJBackend& be, const MDefinition* d) {
   } else {
     loc = uint32_t(be.reserve(WJValType(d->type())));
     be.rematCacheLocal[id] = loc;
+    if (WJGETENV("GECKO_WJ_REMATDBG"))
+      fprintf(stderr, "[rematdbg] mid-emit reserve id=%u op=%u ty=%u loc=%u\n",
+              id, unsigned(d->op()), unsigned(d->type()), loc);
   }
   be.rematValid.insert(id);
   return e.writeOp(Op::LocalTee) && e.writeVarU32(loc);
@@ -3258,7 +3270,8 @@ static bool WJShapeHybrid() {
 }
 static bool WJValueMightBeGCThing(jit::MIRType t);  // fwd (defined near EmitForcePostBarrier)
 static bool EmitForcePostBarrier(Encoder& e, WJBackend& be, jit::MDefinition* objDef,
-                                 jit::MDefinition* valDef);  // fwd (UnsafeSetReservedSlot inline)
+                                 jit::MDefinition* valDef = nullptr);  // fwd (UnsafeSetReservedSlot inline)
+static bool WJHasPostBarrierNode(jit::MDefinition* obj);  // fwd (defined near EmitForcePostBarrier)
 // A slot store is HYBRID-convertible (passthrough guard + store-IC, no deopt) iff
 // its stored value can never be a GC pointer: a non-GC value (Int32/Double/Boolean
 // /etc.) needs NO post-write barrier, so the store-IC's plain I64Store is correct
@@ -5485,6 +5498,18 @@ static bool EmitValue(Encoder& e, WJBackend& be, MInstruction* ins) {
       // deopt storm). GECKO_WJ_NOBCDEOPT.
       if (WJGETENV("GECKO_WJ_NOBCDEOPT")) return GetLocal(e, uint32_t(il));
       int32_t mn = bc->minimum(), mx = bc->maximum();
+      // SELF-BOUND SWITCH FIX (be.selfBoundSwitch): Warp hoists the in-case loads
+      // buf[i] (offset 0) + buf[i+1] (offset 1) into one BoundsCheck with max=1. The
+      // max>0 portion only guarantees the SEPARATE unguarded buf[i+1] load, which now
+      // self-bounds (selfBoundOOB above) -> the hoisted max deopt is redundant AND
+      // spurious at the loop boundary (deopts on the bps=1 last iteration that never
+      // reads buf[i+1]), and its resume corrupts the result. Clamp max (and the
+      // symmetric min) to 0 so we guard ONLY the base index (buf[i] stays i<len
+      // guarded); buf[i+1] safety comes from its own self-bound.
+      if (be.selfBoundSwitch) {
+        if (mx > 0) mx = 0;
+        if (mn < 0) mn = 0;
+      }
       if (mn == 0 && mx == 0) {
         // Common case: deopt unless (uint32)index < (uint32)length.
         if (!GetLocal(e, uint32_t(il)) || !GetLocal(e, uint32_t(ll)) ||
@@ -5665,11 +5690,44 @@ static bool EmitValue(Encoder& e, WJBackend& be, MInstruction* ins) {
       bool holeCheck = andUnbox ? false : ins->toLoadElement()->needsHoleCheck();
       int32_t il = be.local(idxD);
       if (il < 0) return false;
-      // OOB-SAFE self-bounded load (paired with a deopt-skipped BoundsCheck): the
-      // index's BoundsCheck no longer deopts, so bound here and return undefined on
-      // OOB (and on an in-bounds hole) -- MLoadElementHole semantics, no deopt.
-      if (!andUnbox && ins->type() == MIRType::Value && idxD->isBoundsCheck() &&
-          WJBoundsCheckOOBSafe(idxD)) {
+      // UNGUARDED INDEX: the default emission below does a RAW elements[idx] load with
+      // NO initializedLength check -- correct ONLY if a dominating MBoundsCheck deopts
+      // on OOB. A fresh in-switch-case load like buf[i+1] (index = an Add, NOT covered
+      // by any BoundsCheck) has none, so OOB (idx>=initializedLength) reads adjacent
+      // heap GARBAGE (the reloop-switch wrong-value root cause; see reloop-bug-notes).
+      // Detect "index has no BoundsCheck" and self-bound (return undefined on OOB) to
+      // match JS. GECKO_WJ_NOOOBGUARD reverts. (idxD->isBoundsCheck() = spectre form,
+      // already safe; else scan idxD's uses for a BoundsCheck consumer that guards it.)
+      bool idxGuarded = idxD->isBoundsCheck();
+      if (!idxGuarded) {
+        for (MUseIterator u = idxD->usesBegin(); u != idxD->usesEnd(); u++) {
+          MNode* c = u->consumer();
+          if (c->isDefinition() && c->toDefinition()->isBoundsCheck()) {
+            idxGuarded = true;
+            break;
+          }
+        }
+      }
+      // DEFAULT-OFF (opt-in GECKO_WJ_OOBGUARD): self-bounding unguarded LoadElements
+      // is the correct direction, but it did NOT resolve the reloop-min wrong value
+      // (the OOB buf[i+1] read is a rare interspersed bps=2 event; the residual bug is
+      // deeper -- likely deopt-in-reloop / stride interaction). Gated off until the
+      // full reloop bug is understood, so this broad change can't regress real loads.
+      // Correctness of switch-in-loop is already ensured by the reloop-switch bails.
+      bool selfBoundOOB =
+          !idxGuarded && (WJGETENV("GECKO_WJ_OOBGUARD") || be.selfBoundSwitch);
+      if (selfBoundOOB && andUnbox) {
+        // Typed unbox of an unguarded (possibly-OOB) load -> can't cheaply return a
+        // typed OOB result; bail this fn to PBL (correct, rare).
+        js::wasm::gWJBailReason = "loadelem-unguarded-unbox";
+        return false;
+      }
+      // OOB-SAFE self-bounded load: either the index's BoundsCheck was deopt-skipped
+      // (GECKO_WJ_OOBLOAD), OR the index has NO BoundsCheck at all (selfBoundOOB).
+      // Bound here and return undefined on OOB (and on an in-bounds hole) --
+      // MLoadElementHole semantics, no deopt.
+      if (!andUnbox && ins->type() == MIRType::Value &&
+          (selfBoundOOB || (idxD->isBoundsCheck() && WJBoundsCheckOOBSafe(idxD)))) {
         int64_t undefBits = int64_t(JS::UndefinedValue().asRawBits());
         // inBounds = (uint32)index < (uint32)initializedLength(elements)
         if (!GetLocal(e, uint32_t(il)) || !GetOp(e, be, elemsD) ||
@@ -7842,6 +7900,74 @@ static bool EmitValue(Encoder& e, WJBackend& be, MInstruction* ins) {
     }
     case MDefinition::Opcode::ArrayPush: {
       MArrayPush* a = ins->toArrayPush();
+      // INLINE dense-append fast path (Ion parity): arr.push(v) appends at index ==
+      // length. For a packed dense array length == initializedLength, so when
+      // (initializedLength < capacity) && (length == initializedLength) the push is a
+      // pure GC-FREE append into spare capacity -- do it inline (store value, bump
+      // initializedLength + length, inline post-write barrier) and return the new
+      // length, with NO C++ helper hop / GC safepoint. push is ubiquitous in real code
+      // (building result arrays in parsers/decoders/map-filter); the helper hop was a
+      // direct Ion-parity gap. Same proven pattern as StoreElementHole's SEHAPPEND.
+      // Non-append cases (length != initializedLength: trailing-hole arrays; or
+      // initializedLength >= capacity: needs realloc) fall to the WJH_ARRAYPUSH helper
+      // (correct, grows in C++). GECKO_WJ_NOARRAYPUSHINLINE reverts to the pure helper.
+      int32_t objL = be.local(a->object());
+      static int noInline = WJGETENV("GECKO_WJ_NOARRAYPUSHINLINE") ? 1 : 0;
+      if (!noInline && objL >= 0) {
+        const uint32_t offIL = uint32_t(js::ObjectElements::offsetOfInitializedLength());
+        const uint32_t offCap = uint32_t(js::ObjectElements::offsetOfCapacity());
+        const uint32_t offLen = uint32_t(js::ObjectElements::offsetOfLength());
+        // elements = obj->elements_  (reloaded on each use, like MElements)
+        auto elems = [&]() -> bool {
+          return GetLocal(e, uint32_t(objL)) && e.writeOp(Op::I32Load) &&
+                 e.writeVarU32(2) &&
+                 e.writeVarU32(uint32_t(js::NativeObject::offsetOfElements()));
+        };
+        auto hdr = [&](uint32_t off) -> bool {  // load an i32 ObjectElements header field
+          // header offsets (initializedLength/capacity/length) are NEGATIVE relative to
+          // the elements pointer, so add them to the address (memarg offset is unsigned).
+          return elems() && e.writeOp(Op::I32Const) && e.writeVarS32(int32_t(off)) &&
+                 e.writeOp(Op::I32Add) && e.writeOp(Op::I32Load) && e.writeVarU32(2) &&
+                 e.writeVarU32(0);
+        };
+        // cond = (initializedLength <u capacity) & (length == initializedLength)
+        if (!hdr(offIL) || !hdr(offCap) || !e.writeOp(Op::I32LtU)) return false;
+        if (!hdr(offLen) || !hdr(offIL) || !e.writeOp(Op::I32Eq)) return false;
+        if (!e.writeOp(Op::I32And)) return false;
+        if (!e.writeOp(Op::If) || !e.writeFixedU8(uint8_t(TypeCode::I32))) return false;
+        // append at index == initializedLength: elements[IL*8] = boxed value
+        if (!elems() || !hdr(offIL) || !e.writeOp(Op::I32Const) ||
+            !e.writeVarS32(int32_t(sizeof(JS::Value))) || !e.writeOp(Op::I32Mul) ||
+            !e.writeOp(Op::I32Add))
+          return false;
+        if (!EmitSpillValue(e, be, a->value())) return false;
+        if (!e.writeOp(Op::I64Store) || !e.writeVarU32(3) || !e.writeVarU32(0))
+          return false;
+        // initializedLength = IL + 1
+        if (!elems() || !e.writeOp(Op::I32Const) || !e.writeVarS32(int32_t(offIL)) ||
+            !e.writeOp(Op::I32Add) || !hdr(offIL) || !e.writeOp(Op::I32Const) ||
+            !e.writeVarS32(1) || !e.writeOp(Op::I32Add) || !e.writeOp(Op::I32Store) ||
+            !e.writeVarU32(2) || !e.writeVarU32(0))
+          return false;
+        // length = IL + 1 (length == IL held on the fast path; IL field now IL+1)
+        if (!elems() || !e.writeOp(Op::I32Const) || !e.writeVarS32(int32_t(offLen)) ||
+            !e.writeOp(Op::I32Add) || !hdr(offIL) || !e.writeOp(Op::I32Store) ||
+            !e.writeVarU32(2) || !e.writeVarU32(0))
+          return false;
+        // GC-value append: inline post-write barrier (dedup if Warp emitted one).
+        if (WJTypeMaybeGC(a->value()->type()) && !WJHasPostBarrierNode(a->object()) &&
+            !EmitForcePostBarrier(e, be, a->object()))
+          return false;
+        // result (new length) = IL field (now IL+1)
+        if (!hdr(offIL)) return false;
+        if (!e.writeOp(Op::Else)) return false;
+        if (!EmitStageScratch(e, be, a->object(), 0)) return false;
+        if (!EmitStageScratch(e, be, a->value(), 1)) return false;
+        if (!EmitHelperCallResult(e, be, ins, WJH_ARRAYPUSH, 0) ||
+            !e.writeOp(Op::I32WrapI64))
+          return false;
+        return e.writeOp(Op::End);
+      }
       if (!EmitStageScratch(e, be, a->object(), 0)) return false;
       if (!EmitStageScratch(e, be, a->value(), 1)) return false;
       // result is the new length (Int32): unbox the helper's boxed Int32 result.
@@ -10066,7 +10192,7 @@ static bool WJHasPostBarrierNode(jit::MDefinition* obj) {
   return false;
 }
 static bool EmitForcePostBarrier(Encoder& e, WJBackend& be, jit::MDefinition* objDef,
-                                 jit::MDefinition* valDef = nullptr) {
+                                 jit::MDefinition* valDef) {
   // Inline the isTenured() gate (Ion's branchPtrInNurseryChunk) so we STAY IN
   // WASM for the common case: a NURSERY container needs no store-buffer entry, so
   // skip the C++ WJH_POSTBARRIER helper entirely for it. chunk(obj)->storeBuffer
@@ -11352,19 +11478,59 @@ static bool EmitReturn(Encoder& e, WJBackend& be, MDefinition* val) {
   return e.writeOp(Op::Return);  // EHABI: [result]; old: [flag, result]
 }
 
+// Per-def/phi VALUE tracer emit (GECKO_WJ_VALUETRACE=<lineno>): store the local's
+// value bits to gWJTraceVal, then call wjhelp(251, id) so the runtime records (id,val).
+static bool EmitValueTrace(Encoder& e, WJBackend& be, uint32_t localIdx, uint8_t ty,
+                           uint32_t id) {
+  static int vtLine = -2;
+  if (vtLine == -2) {
+    const char* s = WJGETENV("GECKO_WJ_VALUETRACE");
+    vtLine = s ? atoi(s) : -1;
+  }
+  if (vtLine < 0 || !be.info || !be.info->script() ||
+      int(be.info->script()->lineno()) != vtLine)
+    return true;
+  if (ty != uint8_t(TypeCode::I32) && ty != uint8_t(TypeCode::I64) &&
+      ty != uint8_t(TypeCode::F64))
+    return true;
+  if (!e.writeOp(Op::I32Const) ||
+      !e.writeVarS32(int32_t(uintptr_t(&js::wasm::gWJTraceVal))))
+    return false;
+  if (!e.writeOp(Op::LocalGet) || !e.writeVarU32(localIdx)) return false;
+  if (ty == uint8_t(TypeCode::I32)) {
+    if (!e.writeOp(Op::I64ExtendI32S)) return false;
+  } else if (ty == uint8_t(TypeCode::F64)) {
+    if (!e.writeOp(Op::I64ReinterpretF64)) return false;
+  }
+  if (!e.writeOp(Op::I64Store) || !e.writeVarU32(3) || !e.writeVarU32(0)) return false;
+  return e.writeOp(Op::F64Const) && e.writeFixedF64(251.0) &&
+         e.writeOp(Op::F64Const) && e.writeFixedF64(double(id)) &&
+         e.writeOp(Op::Call) && e.writeVarU32(0) && e.writeOp(Op::Drop);
+}
+
 static bool EmitEdgeCopies(Encoder& e, WJBackend& be, MBasicBlock* from,
                            MBasicBlock* to) {
   uint32_t k = to->getPredecessorIndex(from);
   std::vector<int32_t> dsts;
+  std::vector<MPhi*> phis;
   for (MPhiIterator p = to->phisBegin(); p != to->phisEnd(); p++) {
     MPhi* phi = *p;
     int32_t dst = be.local(phi);
     if (dst < 0) continue;
     if (!GetOp(e, be, phi->getOperand(k))) return false;  // push old value
     dsts.push_back(dst);
+    phis.push_back(phi);
   }
   for (size_t i = dsts.size(); i-- > 0;) {
     if (!e.writeOp(Op::LocalSet) || !e.writeVarU32(uint32_t(dsts[i]))) return false;
+  }
+  // VALUE TRACE (GECKO_WJ_VALUETRACE): record each phi's value on this edge, so the
+  // switch-merge phi (the reloop miscompile) is visible. phiId encoded as id (biased
+  // by 1000000 so it reads distinctly from straight-line defs in the dump).
+  for (size_t i = 0; i < phis.size(); i++) {
+    if (!EmitValueTrace(e, be, uint32_t(dsts[i]), WJValType(phis[i]->type()),
+                        1000000 + phis[i]->id()))
+      return false;
   }
   return true;
 }
@@ -11702,6 +11868,9 @@ static bool EmitBlockBody(Encoder& e, WJBackend& be, MBasicBlock* b) {
         js::wasm::gWJBailReason = "value-localset";
         return false;
       }
+      // Per-def VALUE tracer (GECKO_WJ_VALUETRACE=<lineno>): see EmitValueTrace.
+      if (!EmitValueTrace(e, be, uint32_t(l), WJValType(ins->type()), ins->id()))
+        return false;
     }
     // Resume-AFTER op completed: its result is now in-local, so the resume-after
     // frame is consistent. Advance the deopt rp for subsequent ops, the terminator
@@ -13108,6 +13277,7 @@ bool js::wasm::WJEmitBody(MIRGenerator& mir, MIRGraph& graph, uint32_t nargs,
   // safe (gbemu, which HAS a switch, is unaffected: 743->751). GECKO_WJ_NOSWITCHREMAT
   // reverts. See [[reloop-tableswitch-miscompile]].
   bool hasReloopSwitch = false;
+  bool hasLoopArrayPush = false;  // Array push inside a loop -> reloop-switch miscompile trigger
   for (MBasicBlock* b : blocks) {
     if (b->loopDepth() > maxLoopDepth) maxLoopDepth = b->loopDepth();
     if (b->loopDepth() > 0 && b->lastIns() && b->lastIns()->isTableSwitch())
@@ -13125,6 +13295,9 @@ bool js::wasm::WJEmitBody(MIRGenerator& mir, MIRGraph& graph, uint32_t nargs,
         case MDefinition::Opcode::SetPropertyCache:
           hasCalls = true;  // reloop's structural overhead is a loss when a
           break;            // C++/helper hop dominates the loop (richards)
+        case MDefinition::Opcode::ArrayPush:
+          if (b->loopDepth() > 0) hasLoopArrayPush = true;
+          break;
         case MDefinition::Opcode::ArgumentsLength:
           be.usesArgc = true;  // -> snapshot gWJCallArgc into actualArgcLocal at entry
           break;
@@ -13209,6 +13382,34 @@ bool js::wasm::WJEmitBody(MIRGenerator& mir, MIRGraph& graph, uint32_t nargs,
     return false;
   }
 
+  // ROOT CAUSE (2026-07-09, CORRECTED): the switch-in-loop MERGE-PHI codegen is
+  // actually CORRECT -- proven by a padded-buffer test (buffer sized so i+1 is always
+  // < initializedLength => the hoisted BoundsCheck never deopts => 3000/3000 calls
+  // byte-correct). The wrong values (repro -158573814 vs PBL 507145716) come ENTIRELY
+  // from a SPURIOUS hoisted-BoundsCheck boundary deopt whose RESUME is broken: Warp
+  // hoists the two in-case loads buf[i] (offset 0) + buf[i+1] (offset 1) into ONE
+  // BoundsCheck with max=1, so on the last iteration (i=len-1, taking the bps=1 case
+  // that only reads buf[i]) the check `i+1 >= len` deopts even though buf[i+1] is never
+  // accessed -- and that deopt-resume into the switch-in-loop-with-ArrayPush corrupts
+  // the whole result (all-zero cp). Removing the deopt (NOBCDEOPT) or padding the buffer
+  // makes it correct. So the FIX is to emit these deopt-free instead of bailing:
+  //   (be.selfBoundSwitch) clamp hoisted BoundsChecks to guard only the base index
+  //   (buf[i] stays i<len guarded) + self-bound the unguarded in-case loads (buf[i+1]
+  //   returns undefined/0 on true OOB, MLoadElementHole semantics) -> no boundary deopt
+  //   -> no broken resume -> correct AND fully JIT (0 bails, proven on the repro).
+  // DEFAULT: still bail (correct, slower). GECKO_WJ_SELFBOUNDSWITCH opts into the fix
+  // (self-bound is sound for dense arrays with no indexed proto props; a proto-indexed
+  // guard is needed before default-on -- next turn). GECKO_WJ_NORELOOPBAIL forces raw
+  // (unsafe: re-exposes the wrong values). See [[cf-challenge-reloop-root-cause]].
+  if (hasReloopSwitch && hasLoopArrayPush && !WJGETENV("GECKO_WJ_NORELOOPBAIL")) {
+    if (WJGETENV("GECKO_WJ_SELFBOUNDSWITCH")) {
+      be.selfBoundSwitch = true;
+    } else {
+      js::wasm::gWJBailReason = "reloop-switch-arraypush";
+      return false;
+    }
+  }
+
   // Diagnostic: per-function MIR opcode histogram (GECKO_WJ_OPHIST). Used to see
   // whether hot property/array accesses fold to inline loads (LoadFixedSlot/
   // LoadElement) vs fall to C++ helper hops (GetPropertyCache/MegamorphicLoadSlot)
@@ -13259,6 +13460,32 @@ bool js::wasm::WJEmitBody(MIRGenerator& mir, MIRGraph& graph, uint32_t nargs,
             s ? s->lineno() : 0, fname, total);
     for (auto& kv : hist) fprintf(stderr, " %s=%u", kv.first.c_str(), kv.second);
     fprintf(stderr, "\n");
+  }
+
+  // PRE-RESERVE remat locals (GECKO_WJ_PRERESERVE): the rematCache (GetOp) reserves
+  // a local per cached Unbox-object/GuardShape def DURING body emit -- AFTER the local
+  // decl count is written just below -> "invalid local index" V8 reject (the accidental
+  // mask for reloop-switch). Reserve them now (before decls) + pre-populate
+  // rematCacheLocal so GetOp reuses them -> valid module. Then we can test whether the
+  // reloop codegen is correct once the mask is removed. Only for reloop-switch fns
+  // (where rematCacheOn will be set).
+  if (hasReloopSwitch && WJGETENV("GECKO_WJ_PRERESERVE")) {
+    for (MBasicBlock* b : blocks) {
+      for (MInstructionIterator it = b->begin(); it != b->end(); it++) {
+        MInstruction* ins = *it;
+        auto op = ins->op();
+        bool cacheable =
+            (op == MDefinition::Opcode::Unbox &&
+             (ins->type() == MIRType::Object || ins->type() == MIRType::String ||
+              ins->type() == MIRType::Symbol || ins->type() == MIRType::BigInt)) ||
+            op == MDefinition::Opcode::GuardShape ||
+            op == MDefinition::Opcode::GuardShapeList;
+        if (cacheable && !be.rematCacheLocal.count(ins->id())) {
+          be.rematCacheLocal[ins->id()] =
+              uint32_t(be.reserve(WJValType(ins->type())));
+        }
+      }
+    }
   }
 
   const uint32_t bidLocal = be.paramCount + uint32_t(be.localTy.size());
@@ -13563,7 +13790,11 @@ bool js::wasm::WJEmitBody(MIRGenerator& mir, MIRGraph& graph, uint32_t nargs,
   // Default-off (perf); force-on for switch-in-loop fns (correctness, see above).
   be.rematCacheOn = WJGETENV("GECKO_WJ_REMATCACHE") ||
                     (hasReloopSwitch && !WJGETENV("GECKO_WJ_NOSWITCHREMAT"));
-  be.rematCacheLocal.clear();
+  // Keep the default clear (be is fresh per compile, so it's a no-op there), but
+  // SKIP it under GECKO_WJ_PRERESERVE: that pre-pass populates rematCacheLocal with
+  // locals reserved BEFORE the decl count was written, and clearing would make GetOp
+  // reserve fresh locals mid-emit past the declared count (invalid local index).
+  if (!WJGETENV("GECKO_WJ_PRERESERVE")) be.rematCacheLocal.clear();
   be.rematValid.clear();
   static int forceReloop = WJGETENV("GECKO_WJ_RELOOP") ? 1 : 0;
   static int noReloop = WJGETENV("GECKO_WJ_NORELOOP") ? 1 : 0;

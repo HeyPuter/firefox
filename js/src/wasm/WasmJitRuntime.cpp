@@ -179,6 +179,7 @@ double gWJCompileOKMs = 0.0;
 double gWJHostCompileMs = 0.0;
 double gWJHostInstMs = 0.0;
 uint64_t gWJEmitBytes = 0;
+int64_t gWJTraceVal = 0;  // per-def value tracer staging (GECKO_WJ_VALUETRACE)
 double gWJSnapshotMs = 0.0;
 double gWJBuildMs = 0.0;
 double gWJOptimizeMs = 0.0;
@@ -407,6 +408,11 @@ struct WJEntry {
   // DEFERRED COMPILE (GECKO_WJ_DEFERCOMPILE): true while this script sits in the
   // pending-compile queue (crossed the warmup threshold but not yet compiled).
   bool queued = false;
+  // # of observes seen while queued but not yet drained. If a drain never happens
+  // (a compute-bound page that never idles, or a harness with no task boundary),
+  // this climbs; past kWJDeferStrandLimit we compile SYNCHRONOUSLY so a hot fn is
+  // never stranded in PBL forever. Loads drain at a task boundary well before this.
+  uint32_t queuedObserves = 0;
 };
 
 // Per-script compile state. Keyed by JSScript*; entries persist for the process.
@@ -600,7 +606,25 @@ bool js::wasm::WasmJitObserveCall(JSScript* script) {
   // entirely in PBL (fast); repeated execution drains between tasks so hot fns still
   // get JIT'd (throughput preserved). Only defer the FIRST compile decision (fails==0,
   // not draining) -- retries after a bail and drain-time compiles go inline.
-  static int deferCompile = getenv("GECKO_WJ_DEFERCOMPILE") ? 1 : 0;
+  // Enabled by GECKO_WJ_DEFERCOMPILE (any value). The BROWSER embed (embed-xul
+  // main()) setenv's it on by DEFAULT since it wires an idle-loop drain
+  // (WasmJitDrainDeferred); the node embed leaves it OFF (its single-JS::Evaluate
+  // benchmark harness has no intra-loop task boundary to drain at, so deferring
+  // would strand hot fns in PBL and crater octane/jetstream). GECKO_WJ_NODEFER
+  // force-disables (for A/B). Requires the embed to call WasmJitDrainDeferred() at
+  // an idle/task boundary, else deferred fns never compile.
+  static int deferCompile =
+      (getenv("GECKO_WJ_DEFERCOMPILE") && !getenv("GECKO_WJ_NODEFER")) ? 1 : 0;
+  // STRAND LIMIT: if a hot fn is observed this many times while queued but no drain
+  // has compiled it, fall through to a SYNCHRONOUS compile instead of staying in PBL
+  // forever. This is the safety net for (a) a compute-bound page that never yields to
+  // the idle-drain, and (b) a harness (node octane) with no intra-loop task boundary
+  // -- both otherwise strand every hot fn in PBL (octane cratered 18x). A real LOAD
+  // drains at its first task boundary long before this, so it keeps the defer benefit.
+  // GECKO_WJ_DEFERSTRAND overrides the limit (0 = never fall through, old behavior).
+  static uint32_t strandLimit =
+      getenv("GECKO_WJ_DEFERSTRAND") ? uint32_t(atoi(getenv("GECKO_WJ_DEFERSTRAND")))
+                                     : 4096;
   if (deferCompile && !gWJDrainingNow && e.fails == 0 &&
       e.state == WJEntry::State::Cold) {
     // Enqueue on first qualification; on EVERY later observe stay in PBL (return
@@ -608,9 +632,18 @@ bool js::wasm::WasmJitObserveCall(JSScript* script) {
     // through to the inline compile and defeat the deferral.
     if (!e.queued) {
       e.queued = true;
+      e.queuedObserves = 0;
       gWJDeferQueue.push_back(script);
     }
-    return false;
+    // Stay in PBL until either the drain compiles it OR we hit the strand limit, at
+    // which point fall through to compile synchronously (a hot fn stranded because
+    // no drain ever fired).
+    if (strandLimit == 0 || ++e.queuedObserves < strandLimit) {
+      return false;
+    }
+    // fall through: synchronous compile of a stranded hot fn (queued flag stays set;
+    // the queued slot in gWJDeferQueue becomes a no-op when drained since state
+    // advances past Cold below).
   }
 
   JSContext* cx = js::TlsContext.get();
@@ -1538,10 +1571,13 @@ static void WJDumpTraceAtExit() {
   fprintf(stderr, "\n");
 }
 
+static void WJDumpVTraceAtExit();  // fwd decl (defined below, near wjhelpImpl)
+
 // JS-callable (shell builtin `wjTraceDump()`): dump the JIT execution-trace ring now
 // (e.g. from a bench's catch block, right at the failure).
 extern "C" EMSCRIPTEN_KEEPALIVE void WJTraceDumpNow() {
   WJDumpTraceAtExit();
+  WJDumpVTraceAtExit();  // per-def value tracer (GECKO_WJ_VALUETRACE)
   // GECKO_WJ_DUMPADDR=a,b,...: dump the i64 at each (const-pool slot) address, decoded.
   if (const char* da = getenv("GECKO_WJ_DUMPADDR")) {
     char buf[256]; snprintf(buf, sizeof buf, "%s", da);
@@ -1552,6 +1588,34 @@ extern "C" EMSCRIPTEN_KEEPALIVE void WJTraceDumpNow() {
       fprintf(stderr, "[wj-dumpaddr] @%lu = %016llx tag=%08x ptr=%08x\n",
               (unsigned long)a, (unsigned long long)v, tag, uint32_t(v));
     }
+  }
+}
+
+// Per-def VALUE tracer (GECKO_WJ_VALUETRACE=<lineno>, helper kind 251). The backend
+// stores each def's value bits to gWJTraceVal then calls wjhelp(251, defId); we record
+// (defId, value) oldest->newest and dump at exit. This is the "real debugger" for
+// miscompiles: read the trace to find the FIRST def whose value diverges from expected
+// (or diff two runs: feature on/off). Complements the block-PATH tracer (kind 250).
+// gWJTraceVal is defined with the other gWJ* globals above (js::wasm namespace).
+static const uint32_t kWJVTraceN = 1u << 20;
+static uint32_t* gWJVTDef = nullptr;
+static int64_t* gWJVTVal = nullptr;
+static uint64_t gWJVTCount = 0;
+static void WJDumpVTraceAtExit() {
+  if (!gWJVTDef || !gWJVTCount) return;
+  uint64_t cap = getenv("GECKO_WJ_VTRACEN")
+                     ? uint64_t(atoi(getenv("GECKO_WJ_VTRACEN")))
+                     : 400;
+  uint64_t n = gWJVTCount < kWJVTraceN ? gWJVTCount : kWJVTraceN;
+  if (n > cap) n = cap;  // show the last `cap` entries by default (small repros)
+  uint64_t start = (gWJVTCount - n) & (kWJVTraceN - 1);
+  fprintf(stderr, "[wj-vtrace] %llu def-values (showing last %llu):\n",
+          (unsigned long long)gWJVTCount, (unsigned long long)n);
+  for (uint64_t i = 0; i < n; i++) {
+    uint64_t j = (start + i) & (kWJVTraceN - 1);
+    int64_t v = gWJVTVal[j];
+    fprintf(stderr, "[wj-vtrace] def%u = %lld (0x%llx)\n", gWJVTDef[j],
+            (long long)v, (unsigned long long)v);
   }
 }
 
@@ -1579,6 +1643,17 @@ static double wjhelpImpl(double kindF, double siteF) {
     // Array.isArray, breaking ubo/webtooling. 2026-07-02 fix.)
     if (!gWJTraceBuf) { gWJTraceBuf = new uint32_t[kWJTraceN](); atexit(WJDumpTraceAtExit); }
     gWJTraceBuf[gWJTraceCount++ & (kWJTraceN - 1)] = uint32_t(int64_t(siteF));
+    return 0.0;
+  }
+  if (kind == 251) {  // WJH_VTRACE: record (defId=siteF, gWJTraceVal). See value tracer.
+    if (!gWJVTDef) {
+      gWJVTDef = new uint32_t[kWJVTraceN]();
+      gWJVTVal = new int64_t[kWJVTraceN]();
+      atexit(WJDumpVTraceAtExit);
+    }
+    uint64_t idx = gWJVTCount++ & (kWJVTraceN - 1);
+    gWJVTDef[idx] = uint32_t(int64_t(siteF));
+    gWJVTVal[idx] = gWJTraceVal;
     return 0.0;
   }
   JSContext* cx = js::TlsContext.get();
