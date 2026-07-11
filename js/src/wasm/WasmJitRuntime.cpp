@@ -43,6 +43,7 @@
 #include "vm/NativeObject.h"
 #include "vm/PlainObject.h"  // js::PlainObject::createWithShape
 #include "vm/EnvironmentObject.h"  // js::CallObject::createWithShape
+#include <cstdarg>  // WJStatsJSON (task #57 __wjStats)
 #include "vm/Scope.h"  // js::LexicalScope (WJH_NEWLEXENV)
 #include "vm/Interpreter.h"  // SetObjectElement, InstanceofOperator, LessThan, ...
 #include "vm/EqualityOperations.h"  // LooselyEqual, StrictlyEqual
@@ -397,7 +398,8 @@ struct WJEntry {
   int tblSlot = -1;  // dense shared-table slot (-1 = not call_indirect-able)
   int directIdx = -1;  // slot in MAIN indirect table for direct PBL->JIT entry
   uint32_t jitRuns = 0;  // entries that ran fully in JIT (no deopt)
-  uint32_t deopts = 0;   // entries that deopted to PBL (resume)
+  uint32_t deopts = 0;   // entries that deopted to PBL (resume); RESET on recompile
+  uint32_t deoptsTotal = 0;  // lifetime deopts, never reset (matches gWJDeoptByOp scale)
   uint32_t recompiles = 0;  // deopt-storm-triggered recompiles so far
   uint32_t gggDeopts = 0;   // GuardGlobalGeneration deopts (global redefined since
                             // compile). Storm control: >=4 -> respec (fresh
@@ -455,10 +457,13 @@ static bool gWJDrainingNow = false;
 
 static WJEntry& EntryFor(JSScript* script) {
   if (!gEntries) gEntries = new std::unordered_map<JSScript*, WJEntry>();
-  // Direct-mapped cache (512-way): a 1-entry cache thrashed on uBlock's alternating
-  // callees -> the operator[] emplace showed ~0.9% in the profile. Element addresses
-  // are stable across rehashes, so caching WJEntry* is safe.
-  static const uint32_t kECBits = 9;
+  // Direct-mapped cache: a 1-entry cache thrashed on uBlock's alternating callees ->
+  // the operator[] emplace showed ~0.9% in the profile. Element addresses are stable
+  // across rehashes, so caching WJEntry* is safe. 8192-way (was 512): typescript's
+  // working set is ~2500 scripts (1409 compiled + ~1017 cold), which 5x-oversubscribed
+  // a 512-slot cache -> collision thrash on hot alternating callees; 8192 slots holds
+  // the set at ~0.3 load (2026-07-11 profile follow-up; 128KB, negligible).
+  static const uint32_t kECBits = 13;
   static const uint32_t kECMask = (1u << kECBits) - 1;
   static JSScript* sECScript[1u << kECBits] = {};
   static WJEntry* sECEntry[1u << kECBits] = {};
@@ -515,6 +520,104 @@ static uint32_t WarmupDelay() {
 }  // namespace
 
 bool js::wasm::WasmJitInWasm() { return js::wasm::gWJExecDepth > 0; }
+
+// __wjStats() backend: aggregate the ALWAYS-ON JIT counters into a JSON string
+// (no env flags, queryable mid-run -- the printf-free introspection of task #57).
+// Per-entry deopts/jitRuns are maintained unconditionally (they drive recompiles),
+// so this is zero added hot-path cost. Reports entry-state tallies, JIT/deopt
+// totals + rate, the top fns by deopt count, and deopt-by-op (named) if the
+// GECKO_WJ_DEOPTHIST counters were populated this run.
+//
+// TRUST THE ALWAYS-ON NUMBERS (deopts/deoptRatePct/topDeoptFns): they are real
+// top-level frame resumes. deoptByOp is a separate DEOPTHIST-only histogram of
+// guard-deopt-instruction *executions*; it matches the per-entry total 1:1 for a
+// non-inlined fn but OVER-counts under inlining (guard sites in inlined callee
+// bodies fire the histogram without each being a distinct top-level resume), so
+// read it only for the RELATIVE ranking of which guard kinds deopt, never as an
+// absolute bail count -- cross-check against deoptRatePct.
+// BROWSER-capturable form of __wjStats: the XUL embed has no JS shell global to
+// hang a native off, and atexit never runs here (-sEXIT_RUNTIME=0 + the runner's
+// process.exit skip C++ dtors), so -- like COMPILESTAT/DEOPTHIST -- we emit the JSON
+// PERIODICALLY during execution to stderr with a grep-able prefix. The playwright
+// harness captures process stderr and reads the LAST `[wj-statsjson] {...}` line
+// once the page has settled (a near-final snapshot). Gated by GECKO_WJ_STATSJSON,
+// throttled to every STATSJSON'th JIT run (env value; default 50000) to bound cost
+// (WJStatsJSON walks gEntries). gWJStatsEvery==0 means the flag is off.
+uint32_t js::wasm::gWJStatsEvery = 0xffffffffu;
+static void WJStatsDumpTick() {
+  if (js::wasm::gWJStatsEvery == 0xffffffffu) {
+    const char* s = getenv("GECKO_WJ_STATSJSON");
+    js::wasm::gWJStatsEvery = s ? uint32_t(atoi(s)) : 0;
+    if (s && js::wasm::gWJStatsEvery == 0) js::wasm::gWJStatsEvery = 50000;
+  }
+  if (!js::wasm::gWJStatsEvery) return;
+  static uint64_t tick = 0;
+  if (++tick % js::wasm::gWJStatsEvery) return;
+  static char buf[8192];
+  js::wasm::WJStatsJSON(buf, sizeof(buf));
+  fprintf(stderr, "[wj-statsjson] %s\n", buf);
+}
+
+void js::wasm::WJStatsJSON(char* buf, size_t n) {
+  if (!buf || n == 0) return;
+  uint32_t compiled = 0, failed = 0, cold = 0;
+  uint64_t totJit = 0, totDeopt = 0, totRecomp = 0;
+  // Rank + total on LIFETIME deopts (deoptsTotal, never reset) so the summary
+  // reconciles with the monotonic gWJDeoptByOp histogram; per-entry `deopts`
+  // is reset on each recompile and would undercount here.
+  struct Top { JSScript* sc; uint32_t deopts, jitRuns; };
+  Top top[8] = {};
+  if (gEntries) {
+    for (auto& kv : *gEntries) {
+      WJEntry& e = kv.second;
+      if (e.state == WJEntry::State::Compiled) compiled++;
+      else if (e.state == WJEntry::State::Failed) failed++;
+      else cold++;
+      totJit += e.jitRuns;
+      totDeopt += e.deoptsTotal;
+      totRecomp += e.recompiles;
+      if (e.deoptsTotal > top[7].deopts) {
+        top[7] = {kv.first, e.deoptsTotal, e.jitRuns};
+        for (int i = 7; i > 0 && top[i].deopts > top[i - 1].deopts; i--) {
+          Top t = top[i]; top[i] = top[i - 1]; top[i - 1] = t;
+        }
+      }
+    }
+  }
+  uint64_t totRuns = totJit + totDeopt;
+  int rate = totRuns ? int((100ull * totDeopt) / totRuns) : 0;
+  size_t o = 0;
+  auto app = [&](const char* fmt, ...) {
+    if (o >= n) return;
+    va_list ap; va_start(ap, fmt);
+    int w = vsnprintf(buf + o, n - o, fmt, ap);
+    va_end(ap);
+    if (w > 0) o += size_t(w);
+  };
+  app("{\"compiled\":%u,\"failed\":%u,\"cold\":%u,\"jitRuns\":%llu,"
+      "\"deopts\":%llu,\"deoptRatePct\":%d,\"recompiles\":%llu,\"topDeoptFns\":[",
+      compiled, failed, cold, (unsigned long long)totJit,
+      (unsigned long long)totDeopt, rate, (unsigned long long)totRecomp);
+  bool first = true;
+  for (int i = 0; i < 8; i++) {
+    if (!top[i].sc || !top[i].deopts) continue;
+    JSScript* sc = top[i].sc;
+    app("%s{\"fn\":\"%s:%u\",\"deopts\":%u,\"jitRuns\":%u}",
+        first ? "" : ",", sc->filename() ? sc->filename() : "?",
+        unsigned(sc->lineno()), top[i].deopts, top[i].jitRuns);
+    first = false;
+  }
+  app("],\"deoptByOp\":[");
+  first = true;
+  for (uint32_t op = 0; op < js::wasm::kWJNumOps; op++) {
+    if (!gWJDeoptByOp[op]) continue;
+    app("%s{\"op\":\"%s\",\"n\":%u}", first ? "" : ",",
+        js::wasm::WJMirOpName(op), gWJDeoptByOp[op]);
+    first = false;
+  }
+  app("]}");
+  if (o >= n) buf[n - 1] = 0;
+}
 
 void js::wasm::WasmJitInvalidateAll(const char* reason) {
   uint32_t n = 0;
@@ -935,11 +1038,13 @@ int js::wasm::WasmJitRunCall(JSScript* script, uint64_t thisBits,
   // so skip the unordered_map find (per-PBL->JIT-entry cost on entry-heavy benches
   // like splay). Map element addresses are stable across rehashes, so caching the
   // WJEntry* is safe; state is re-read fresh each call.
-  // Direct-mapped cache (512-way) over the unordered_map: uBlock alternates between
-  // many callees per call site, so a 1-entry cache thrashed -> the hash find showed
-  // ~0.9% in the profile. Map element addresses are stable across rehashes, so
-  // caching the WJEntry* is safe; state is re-read fresh each call.
-  static const uint32_t kLCBits = 9;
+  // Direct-mapped cache over the unordered_map: uBlock alternates between many callees
+  // per call site, so a 1-entry cache thrashed -> the hash find showed ~0.9% in the
+  // profile. Map element addresses are stable across rehashes, so caching the WJEntry*
+  // is safe; state is re-read fresh each call. 8192-way (was 512): sized to the
+  // ~2500-script working set (typescript) so the RunCall dispatch stops thrashing this
+  // cache (2026-07-11 profile follow-up; 128KB, negligible).
+  static const uint32_t kLCBits = 13;
   static const uint32_t kLCMask = (1u << kLCBits) - 1;
   static JSScript* sLScript[1u << kLCBits] = {};
   static WJEntry* sLEntry[1u << kLCBits] = {};
@@ -1201,6 +1306,7 @@ int js::wasm::WasmJitRunCall(JSScript* script, uint64_t thisBits,
   // after repeated failure fall back to PBL (last resort).
   if (gWJDidResume) {
     e.deopts++;
+    e.deoptsTotal++;
     // GuardGlobalGeneration storm control (see gggDeopts in WJEntry).
     if (gWJLastDeoptOp == js::wasm::gWJOpGuardGlobalGeneration) {
       e.gggDeopts++;
@@ -1368,6 +1474,7 @@ int js::wasm::WasmJitRunCall(JSScript* script, uint64_t thisBits,
     e.jitRuns++;
   }
   gWJWasmRuns++;
+  WJStatsDumpTick();  // GECKO_WJ_STATSJSON: periodic stderr snapshot (browser-capturable)
   if (((gWJFastCalls+gWJSlowCalls) % 20000)==0 && (gWJFastCalls+gWJSlowCalls)>0 && (getenv("GECKO_WJWARP_DUMP")||getenv("GECKO_DEBUG_JIT"))) fprintf(stderr, "[wb-calls] fast=%llu slow=%llu\n", (unsigned long long)gWJFastCalls,(unsigned long long)gWJSlowCalls);
   if (((gWJWasmRuns + gWJWasmDeopts) % 5000) == 0 &&
       (getenv("GECKO_WJWARP_DUMP") || getenv("GECKO_DEBUG_JIT"))) {
@@ -2171,6 +2278,13 @@ static double wjhelpImpl(double kindF, double siteF) {
               gWJOsrDepth++;
               gWJExecDepth++;
               if (osrDbg) gWJOsrHits++;
+              if (osrDbg)
+                fprintf(stderr,
+                        "[wj-osr-fire] %s:%u directIdx=%d blk=%d nargs=%u nlocals=%u "
+                        "execDepth=%d\n",
+                        dscript->filename() ? dscript->filename() : "?",
+                        unsigned(dscript->lineno()), de.directIdx, blk, de.nargs,
+                        de.nlocals, gWJExecDepth);
               double flag = fp(ptr);
               gWJExecDepth--;
               gWJOsrDepth--;
@@ -4089,6 +4203,28 @@ static double wjhelpImpl(double kindF, double siteF) {
     // fill the per-site IC (shape -> TaggedSlotOffset) so the next access loads
     // the slot inline. Property name is baked per-site in gWJPropKey.
     uint32_t site = uint32_t(siteF);
+    // Miss-category histogram (GECKO_WJ_PROPICSTATS): why does this PROPIC helper
+    // hop happen? Distinguishes polymorphic-overflow (way eviction -> a shared
+    // global megamorphic cache would help) from fresh/cold fills and uncacheable
+    // accessor/proxy fallbacks (neither more-ways nor a global cache helps). Drives
+    // the goal-1 lever decision. Counters: 0=own-fresh 1=own-EVICT 2=own-rehit
+    // 3=proto-fill 4=missing-fill 5=uncacheable-fallback. Printed every 500k hops.
+    static int propStats = -1;
+    if (propStats < 0) propStats = getenv("GECKO_WJ_PROPICSTATS") ? 1 : 0;
+    static uint64_t pstat[6] = {0};
+    static uint64_t pstatTot = 0;
+    auto pbump = [&](int c) {
+      if (!propStats) return;
+      pstat[c]++;
+      if ((++pstatTot % 500000) == 0)
+        fprintf(stderr,
+                "[wj-propicstats] %llu hops: own-fresh=%llu own-EVICT=%llu "
+                "own-rehit=%llu proto=%llu missing=%llu uncacheable=%llu\n",
+                (unsigned long long)pstatTot, (unsigned long long)pstat[0],
+                (unsigned long long)pstat[1], (unsigned long long)pstat[2],
+                (unsigned long long)pstat[3], (unsigned long long)pstat[4],
+                (unsigned long long)pstat[5]);
+    };
     RootedValue objv(cx, JS::Value::fromRawBits(gWJScratch[0]));
     JS::RootedId id(cx, JS::PropertyKey::fromRawBits(uintptr_t(gWJPropKey[site])));
     if (objv.isObject() && objv.toObject().is<js::NativeObject>()) {
@@ -4107,6 +4243,7 @@ static double wjhelpImpl(double kindF, double siteF) {
           if (gWJPropShape[base + w] == 0 || gWJPropShape[base + w] == shapeBits)
             break;
         }
+        pbump(w == js::wasm::kWJPropWays ? 1 : (gWJPropShape[base + w] == shapeBits ? 2 : 0));
         if (w == js::wasm::kWJPropWays) w = 0;  // evict way 0
         static int noFill = -1;
         if (noFill < 0) noFill = getenv("GECKO_WJ_PROPNOFILL") ? 1 : 0;
@@ -4160,6 +4297,7 @@ static double wjhelpImpl(double kindF, double siteF) {
           gWJPropOff[base + w] = offBits;
           gWJPropHolder[base + w] =
               uint32_t(uintptr_t(static_cast<void*>(holder)));
+          pbump(3);
           gWJScratch[js::wasm::kWJResultSlot] = holder->getSlot(pp->slot()).asRawBits();
           return 0.0;
         }
@@ -4207,11 +4345,13 @@ static double wjhelpImpl(double kindF, double siteF) {
         gWJPropShape[base + w] = recvShape;
         gWJPropOff[base + w] = js::wasm::kWJPropMissingSentinel;
         gWJPropHolder[base + w] = 0;
+        pbump(4);
         gWJScratch[js::wasm::kWJResultSlot] = JS::UndefinedValue().asRawBits();
         return 0.0;
       }
     }
     // Fallback: accessor/non-native/proxy -> generic get (no caching).
+    pbump(5);
     RootedValue keyv(cx, js::IdToValue(id));
     RootedValue res(cx);
     if (!js::GetElementOperation(cx, objv, keyv, &res)) return 1.0;

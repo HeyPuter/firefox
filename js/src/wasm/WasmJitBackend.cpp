@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <stdio.h>
 #include <limits>
+#include <set>
 #include <unordered_map>
 #include <unordered_set>
 #include <map>
@@ -356,6 +357,7 @@ struct WJBackend {
   uint32_t propObjLocal = 0;      // i32 local: prop-IC receiver pointer
   uint32_t propShapeLocal = 0;    // i32 local: prop-IC receiver shape
   uint32_t propTaggedLocal = 0;   // i32 local: prop-IC tagged slot offset
+  uint32_t propBVKeyLocal = 0;    // i32 local: by-value mega-probe runtime key (atom ptr)
   uint32_t propKeyLocal = 0;      // i64 local: element-store IC boxed key value
   uint32_t allocPosLocal = 0;     // i32 local: inline-alloc old nursery position
   uint32_t allocObjLocal = 0;     // i32 local: inline-alloc result object pointer
@@ -1233,7 +1235,12 @@ static bool EmitObjPtr(Encoder& e, WJBackend& be, MDefinition* v) {
 // gWJResumeVals, record pc + stack depth, and call wjhelp(WJH_RESUME), which
 // rebuilds a PBL frame and finishes the function there.
 static bool EmitDeoptResumeInline(Encoder& e, WJBackend& be) {
-  if (!be.curRp || !be.info) return WJBAIL("resume: no rp/info\n");
+  if (!be.curRp || !be.info) { js::wasm::gWJBailReason = "resume-no-rp"; return WJBAIL("resume: no rp/info\n"); }
+  // Default resume-bail reason so an un-tagged return-false below reports THIS,
+  // not the stale last-emitted op name (WJBAIL doesn't set gWJBailReason). The
+  // intentional bails (forin-loophead-deopt/spill-operand/resume-operand-count)
+  // override it. Fixes babel's misleading "reason=BinaryCache" (task #63/#57).
+  js::wasm::gWJBailReason = "resume-emit-fail";
   // Build the inline frame chain: index 0 = INNERMOST (the deopt point, possibly
   // in an inlined callee), then its callers out to the OUTERMOST (the compiled
   // function). WJH_RESUME runs them innermost->outermost in PBL, threading each
@@ -1405,6 +1412,14 @@ static bool EmitDeoptResumeInline(Encoder& e, WJBackend& be) {
             (d->isPhi() && d->toPhi()->numOperands() > 0 &&
              d->toPhi()->getOperand(0)->op() ==
                  MDefinition::Opcode::ObjectToIterator)) {
+          js::wasm::gWJBailReason = "forin-loophead-deopt";
+          if (WJGETENV("GECKO_WJ_FORINDBG")) {
+            JSScript* fs = be.info ? be.info->script() : nullptr;
+            fprintf(stderr, "[wj-forin-bail] %s:%u deoptOp=%s\n",
+                    fs && fs->filename() ? fs->filename() : "?",
+                    fs ? unsigned(fs->lineno()) : 0,
+                    WJOpName(jit::MDefinition::Opcode(be.curOp)));
+          }
           return WJBAIL("forin-loophead-deopt\n");
         }
       }
@@ -2261,7 +2276,7 @@ static uint32_t WJPropSite(WJBackend& be) {
 static bool EmitPropIC(Encoder& e, WJBackend& be, MInstruction* ins,
                        MDefinition* object, uint64_t keyBits, uint32_t site,
                        js::Shape* bakedShape = nullptr, uint32_t bakedByteOff = 0,
-                       bool bakedFixed = false) {
+                       bool bakedFixed = false, bool knownMega = false) {
   uint32_t base = site * kWJPropWays;
   // Sites are REUSED across recompiles (WJPropSite, keyed by script+read-index). If
   // a warmer recompile shifts which reads convert, a site could be repurposed for a
@@ -2360,10 +2375,21 @@ static bool EmitPropIC(Encoder& e, WJBackend& be, MInstruction* ins,
   // OWN data property (hopsAndKind_==0) before the WJH_PROPIC C++ hop -- megamorphic
   // React/DOM sites (the discord.com/login GETPROP/PROPIC 450K-hop ceiling) hit here.
   // Constant key -> compile-time hash + key. Cache base is a stable per-runtime addr.
-  static int megaCacheEnv = WJGETENV("GECKO_WJ_MEGACACHE") ? 1 : 0;
+  // Mega-cache probe is emitted ONLY for compile-time-KNOWN-megamorphic sites
+  // (MMegamorphicLoadSlot -> knownMega=true). Mono/poly GetPropertyCache sites use
+  // ways+helper: emitting the ~40-op probe on their saturated-but-not-truly-mega
+  // misses REGRESSED octane 3-14% (2026-07-11 clean A/B: deltablue 0.86, richards
+  // 0.95, box2d/crypto/raytrace ~0.96) for zero gain -- those sites' shapes miss the
+  // global cache, so the probe is pure overhead on top of the helper. Warp's op
+  // choice is the right signal (it marks a site mega only after the IC saturates).
+  // Default-ON for the targeted case; GECKO_WJ_NOMEGACACHE reverts. (Legacy
+  // GECKO_WJ_MEGACACHE forced it on for ALL sites -- kept as an override for A/B.)
+  static int megaCacheOff = WJGETENV("GECKO_WJ_NOMEGACACHE") ? 1 : 0;
+  static int megaCacheAll = WJGETENV("GECKO_WJ_MEGACACHE") ? 1 : 0;
+  bool useMega = (knownMega || megaCacheAll) && !megaCacheOff;
   uintptr_t megaCacheAddr = 0;
   uint32_t megaHashConst = 0;
-  if (megaCacheEnv) {
+  if (useMega) {
     JSContext* mcx = js::TlsContext.get();
     if (mcx) {
       megaCacheAddr = uintptr_t(&mcx->runtime()->caches().megamorphicCache);
@@ -8137,7 +8163,11 @@ static bool EmitValue(Encoder& e, WJBackend& be, MInstruction* ins) {
       if (!noPropIC && m->object()->type() == MIRType::Object) {
         uint32_t site = WJPropSite(be);
         if (site != 0) {
-          return EmitPropIC(e, be, ins, m->object(), m->name().asRawBits(), site);
+          // knownMega=true: Warp chose MMegamorphicLoadSlot => this site IS
+          // megamorphic, so the inline js::MegamorphicCache probe pays off here
+          // (unlike mono/poly GetPropertyCache sites -- see EmitPropIC useMega).
+          return EmitPropIC(e, be, ins, m->object(), m->name().asRawBits(), site,
+                            nullptr, 0, false, /*knownMega=*/true);
         }
       }
       if (!EmitStageScratch(e, be, m->object(), 0)) return false;
@@ -8150,6 +8180,132 @@ static bool EmitValue(Encoder& e, WJBackend& be, MInstruction* ins) {
       // accessors correctly (a strict superset of the Ion megamorphic fast path),
       // so routing to WJH_GETPROP is sound. op0 = object, op1 = idVal (Value).
       if (WJGETENV("GECKO_WJ_NO_MLSBV")) return false;
+      MMegamorphicLoadSlotByValue* mbvM = ins->toMegamorphicLoadSlotByValue();
+      auto mbvMiss = [&]() -> bool {
+        return EmitStageScratch(e, be, mbvM->object(), 0) &&
+               EmitStageScratch(e, be, ins->getOperand(1), 1) &&
+               EmitHelperCallResult(e, be, ins, WJH_GETPROP, 0);
+      };
+      // BY-VALUE MEGA PROBE (GECKO_WJ_MEGABYVAL, opt-in, READ-ONLY): obj[atomKey]
+      // hits the per-runtime js::MegamorphicCache inline (shape+key hash -> own-data
+      // slot, no C++ hop) -- the real-SPA dynamic-key GETPROP ceiling (discord
+      // GETPROP=284K). Falls to WJH_GETPROP on non-Object receiver / non-string or
+      // non-atom key / cache miss. Mirrors the const-key emitMegaOrMiss but with a
+      // RUNTIME key+hash (idVal must be a String atom; hash read from the atom with
+      // an isFatInline branch). No allFull-ways gate: Warp emits this op only when mega.
+      // DEFAULT-ON (2026-07-11): validated correct (byval diff JIT==PBL, acorn/diverse)
+      // + engaging (obj[k] GETPROP 5.8M->2.4M) + octane-NEUTRAL (best-of-8 earley 1.03/
+      // crypto 0.985 = noise; full suite ~1.0). Read-only = safe. GECKO_WJ_NOMEGABYVAL reverts.
+      static int mbv = WJGETENV("GECKO_WJ_NOMEGABYVAL") ? 0 : 1;
+      JSContext* mbvCx = mbv ? js::TlsContext.get() : nullptr;
+      if (mbvCx && mbvM->object()->type() == MIRType::Object) {
+        using MC = js::MegamorphicCache;
+        using ME = js::MegamorphicCacheEntry;
+        uintptr_t cacheAddr =
+            uintptr_t(&mbvCx->runtime()->caches().megamorphicCache);
+        const uint32_t flagsOff = uint32_t(JSString::offsetOfFlags());
+        const int32_t ATOMB = int32_t(js::StringFlags::ATOM_BIT);
+        const int32_t FATM = int32_t(js::StringFlags::FAT_INLINE_MASK);
+        const uint32_t fatHashOff = uint32_t(js::FatInlineAtom::offsetOfHash());
+        const uint32_t normHashOff = uint32_t(js::NormalAtom::offsetOfHash());
+        const uint32_t shapeOff = uint32_t(offsetof(JS::shadow::Object, shape));
+        const uint32_t slotsOff = uint32_t(js::NativeObject::offsetOfSlots());
+        const uint8_t I64T = uint8_t(TypeCode::I64);
+        // obj -> propObjLocal ; shape -> propShapeLocal
+        if (!GetOp(e, be, mbvM->object()) || !e.writeOp(Op::LocalSet) ||
+            !e.writeVarU32(be.propObjLocal) || !GetLocal(e, be.propObjLocal) ||
+            !e.writeOp(Op::I32Load) || !e.writeVarU32(2) || !e.writeVarU32(shapeOff) ||
+            !e.writeOp(Op::LocalSet) || !e.writeVarU32(be.propShapeLocal))
+          return false;
+        // idVal tag == JSVAL_TAG_STRING ?
+        if (!GetOp(e, be, ins->getOperand(1)) || !e.writeOp(Op::I64Const) ||
+            !e.writeVarS64(32) || !e.writeOp(Op::I64ShrU) || !e.writeOp(Op::I32WrapI64) ||
+            !e.writeOp(Op::I32Const) ||
+            !e.writeVarS32(int32_t(uint32_t(JSVAL_TAG_STRING))) || !e.writeOp(Op::I32Eq))
+          return false;
+        if (!e.writeOp(Op::If) || !e.writeFixedU8(I64T)) return false;  // is-string
+        // strptr -> propKeyLocal
+        if (!GetOp(e, be, ins->getOperand(1)) || !e.writeOp(Op::I32WrapI64) ||
+            !e.writeOp(Op::LocalSet) || !e.writeVarU32(be.propBVKeyLocal))
+          return false;
+        // atom? flags & ATOM_BIT
+        if (!GetLocal(e, be.propBVKeyLocal) || !e.writeOp(Op::I32Load) ||
+            !e.writeVarU32(2) || !e.writeVarU32(flagsOff) || !e.writeOp(Op::I32Const) ||
+            !e.writeVarS32(ATOMB) || !e.writeOp(Op::I32And))
+          return false;
+        if (!e.writeOp(Op::If) || !e.writeFixedU8(I64T)) return false;  // is-atom
+        // entry ptr -> propTaggedLocal: ((shape>>S1 ^ shape>>S2)+keyHash) & (N-1) *size + base
+        if (!GetLocal(e, be.propShapeLocal) || !e.writeOp(Op::I32Const) ||
+            !e.writeVarS32(MC::ShapeHashShift1) || !e.writeOp(Op::I32ShrU) ||
+            !GetLocal(e, be.propShapeLocal) || !e.writeOp(Op::I32Const) ||
+            !e.writeVarS32(MC::ShapeHashShift2) || !e.writeOp(Op::I32ShrU) ||
+            !e.writeOp(Op::I32Xor))
+          return false;
+        // + keyHash: I32Load at propKeyLocal + (isFatInline ? fatHashOff : normHashOff)
+        if (!GetLocal(e, be.propBVKeyLocal) || !e.writeOp(Op::I32Const) ||
+            !e.writeVarS32(int32_t(fatHashOff)) || !e.writeOp(Op::I32Const) ||
+            !e.writeVarS32(int32_t(normHashOff)) || !GetLocal(e, be.propBVKeyLocal) ||
+            !e.writeOp(Op::I32Load) || !e.writeVarU32(2) || !e.writeVarU32(flagsOff) ||
+            !e.writeOp(Op::I32Const) || !e.writeVarS32(FATM) || !e.writeOp(Op::I32And) ||
+            !e.writeOp(Op::I32Const) || !e.writeVarS32(FATM) || !e.writeOp(Op::I32Eq) ||
+            !e.writeOp(Op::SelectNumeric) || !e.writeOp(Op::I32Add) ||
+            !e.writeOp(Op::I32Load) || !e.writeVarU32(2) || !e.writeVarU32(0) ||
+            !e.writeOp(Op::I32Add))
+          return false;
+        if (!e.writeOp(Op::I32Const) || !e.writeVarS32(int32_t(MC::NumEntries - 1)) ||
+            !e.writeOp(Op::I32And) || !e.writeOp(Op::I32Const) ||
+            !e.writeVarS32(int32_t(sizeof(MC::Entry))) || !e.writeOp(Op::I32Mul) ||
+            !e.writeOp(Op::I32Const) ||
+            !e.writeVarS32(int32_t(cacheAddr + MC::offsetOfEntries())) ||
+            !e.writeOp(Op::I32Add) || !e.writeOp(Op::LocalSet) ||
+            !e.writeVarU32(be.propTaggedLocal))
+          return false;
+        // cond = e.shape==shape & e.key==keyptr & e.gen==gen & e.hopsAndKind==0
+        if (!GetLocal(e, be.propTaggedLocal) || !e.writeOp(Op::I32Load) ||
+            !e.writeVarU32(2) || !e.writeVarU32(uint32_t(ME::offsetOfShape())) ||
+            !GetLocal(e, be.propShapeLocal) || !e.writeOp(Op::I32Eq))
+          return false;
+        if (!GetLocal(e, be.propTaggedLocal) || !e.writeOp(Op::I32Load) ||
+            !e.writeVarU32(2) || !e.writeVarU32(uint32_t(ME::offsetOfKey())) ||
+            !GetLocal(e, be.propBVKeyLocal) || !e.writeOp(Op::I32Eq) || !e.writeOp(Op::I32And))
+          return false;
+        if (!GetLocal(e, be.propTaggedLocal) || !e.writeOp(Op::I32Load16U) ||
+            !e.writeVarU32(1) || !e.writeVarU32(uint32_t(ME::offsetOfGeneration())) ||
+            !e.writeOp(Op::I32Const) ||
+            !e.writeVarS32(int32_t(cacheAddr + MC::offsetOfGeneration())) ||
+            !e.writeOp(Op::I32Load16U) || !e.writeVarU32(1) || !e.writeVarU32(0) ||
+            !e.writeOp(Op::I32Eq) || !e.writeOp(Op::I32And))
+          return false;
+        if (!GetLocal(e, be.propTaggedLocal) || !e.writeOp(Op::I32Load8U) ||
+            !e.writeVarU32(0) || !e.writeVarU32(uint32_t(ME::offsetOfHopsAndKind())) ||
+            !e.writeOp(Op::I32Eqz) || !e.writeOp(Op::I32And))
+          return false;
+        if (!e.writeOp(Op::If) || !e.writeFixedU8(I64T)) return false;  // hit
+        // slotOffset -> propShapeLocal ; base=(tag&1)?obj:slots ; +(tag>>1) ; I64Load
+        if (!GetLocal(e, be.propTaggedLocal) || !e.writeOp(Op::I32Load) ||
+            !e.writeVarU32(2) || !e.writeVarU32(uint32_t(ME::offsetOfSlotOffset())) ||
+            !e.writeOp(Op::LocalSet) || !e.writeVarU32(be.propShapeLocal))
+          return false;
+        if (!GetLocal(e, be.propObjLocal) || !GetLocal(e, be.propObjLocal) ||
+            !e.writeOp(Op::I32Load) || !e.writeVarU32(2) || !e.writeVarU32(slotsOff) ||
+            !GetLocal(e, be.propShapeLocal) || !e.writeOp(Op::I32Const) ||
+            !e.writeVarS32(1) || !e.writeOp(Op::I32And) || !e.writeOp(Op::SelectNumeric))
+          return false;
+        if (!GetLocal(e, be.propShapeLocal) || !e.writeOp(Op::I32Const) ||
+            !e.writeVarS32(1) || !e.writeOp(Op::I32ShrU) || !e.writeOp(Op::I32Add) ||
+            !e.writeOp(Op::I64Load) || !e.writeVarU32(3) || !e.writeVarU32(0))
+          return false;
+        if (!e.writeOp(Op::Else)) return false;  // cache miss
+        if (!mbvMiss()) return false;
+        if (!e.writeOp(Op::End)) return false;   // close hit-if
+        if (!e.writeOp(Op::Else)) return false;  // non-atom
+        if (!mbvMiss()) return false;
+        if (!e.writeOp(Op::End)) return false;   // close atom-if
+        if (!e.writeOp(Op::Else)) return false;  // non-string
+        if (!mbvMiss()) return false;
+        if (!e.writeOp(Op::End)) return false;   // close string-if
+        return true;
+      }
       if (!EmitStageScratch(e, be, ins->getOperand(0), 0)) return false;
       if (!EmitStageScratch(e, be, ins->getOperand(1), 1)) return false;
       return EmitHelperCallResult(e, be, ins, WJH_GETPROP, 0);
@@ -9942,14 +10098,15 @@ static bool EmitValue(Encoder& e, WJBackend& be, MInstruction* ins) {
       // An inlined-frame function forces calls through the slow (clean-boundary) path:
       // the fast call_indirect under an inlined caller corrupts when an error/THROW
       // triggers FrameIter stack-decompilation through the inlined fast-call frames
-      // (JS_CODEGEN_NONE can't walk them -> "unreachable"). MEASURED: removing this wins
-      // big for NON-throwing inlined code (crypto +80%, navier +13%, richards/raytrace
-      // recovered, all correct) but CRASHES ubo (its parser throws through inlined frames
-      // -- and hasCatchTrynote does NOT gate it: the catcher is a DIFFERENT function). So
-      // the SOUND default keeps the wide guard. GECKO_WJ_NARROWINLINESLOW = experimental
-      // narrow (hasCatchTrynote-only, captures the non-throwing wins but ubo crashes --
-      // for use once FrameIter-through-inlined-fast-call is supported). NOINLINESLOWCALL
-      // removes it entirely (fastest, unsound for throwing code).
+      // (JS_CODEGEN_NONE can't walk them -> "unreachable"). The old "crypto +80%,
+      // navier +13%" win from removing this is STALE: re-measured 2026-07-11 best-of-3
+      // idle (NOINLINESLOWCALL=1 vs default) = NEUTRAL-to-NEGATIVE (crypto 1904/1925,
+      // navier 11009/10873, richards 2348/2302, earley 2796/2930) -- the slow WJH_CALL
+      // dispatch got as fast as the fast call_indirect (8192-way entry caches + fast
+      // directIdx C-fn-ptr path). So this guard is now ~FREE; keep it (it also prevents
+      // the ubo FrameIter-through-inlined-fast-call crash on a throw). NARROWINLINESLOW/
+      // NOINLINESLOWCALL are not worth pursuing -- no perf win to capture. See memory
+      // typescript-jit-profile-2026-07-11. NOINLINESLOWCALL removes it (unsound on throw).
       static int narrowSlow = WJGETENV("GECKO_WJ_NARROWINLINESLOW") ? 1 : 0;
       bool forceSlowCall =
           wideCall || forceSlowCallEnv ||
@@ -10741,13 +10898,18 @@ static EffectKind EmitEffect(Encoder& e, WJBackend& be, MInstruction* ins) {
           // mega misses hit WJH_SETPROPIC. The IC self-guards on shape so it's sound
           // for the passthrough'd (polymorphic) guard. HUGE win (richards 152->351,
           // SETPROP 1.9M->0) BUT has a GC-nursery-triggered staleness crash (NO_NURSERY
-          // 100% correct; default/minor-GC crashes "null function") -- a post-write-
-          // barrier/store-staleness bug for the GC sweep. DEFAULT-OFF until fixed;
-          // GECKO_WJ_MEGASTOREIC enables.
-          // Hybrid always uses the store IC (value is provably non-GC -> no barrier,
-          // safe). forceMega keeps the MEGASTOREIC gate (it allows GC-value stores,
-          // which carry the historical barrier-staleness risk).
-          static int megaStoreIC = WJGETENV("GECKO_WJ_MEGASTOREIC") ? 1 : 0;
+          // DEFAULT-ON 2026-07-11 (GECKO_WJ_NOMEGASTOREIC reverts): the historical
+          // "null function" GC-staleness crash is FIXED (by the intervening precise-
+          // rooting/store-barrier work) -- re-validated with gczeal 7,1 (minor GC on
+          // EVERY allocation) on both the existing-slot AND property-ADD paths under
+          // FORCEMEGA+MEGASTOREIC: result == PBL exactly, no crash. Note the store IC
+          // (incl. the ADD-IC post-write barrier) is ALREADY default-on for the other
+          // store callers (SetPropertyCache / MMegamorphicStoreSlot / ADDIC), so this
+          // flip only extends that same validated path to the forceMega StoreFixedSlot
+          // GC-value case -- removing a 4x store cliff (richards-under-FORCEMEGA
+          // 511 -> 2026) for shape-storm store-heavy fns (the real-site pattern).
+          // Hybrid always uses the store IC (value is provably non-GC -> no barrier).
+          static int megaStoreIC = WJGETENV("GECKO_WJ_NOMEGASTOREIC") ? 0 : 1;
           static int hybStoreHelper = WJGETENV("GECKO_WJ_HYBSTOREHELPER") ? 1 : 0;
           bool useIC = (sHybrid && !hybStoreHelper) || megaStoreIC;
           uint32_t site = useIC ? WJPropSite(be) : 0;
@@ -13395,6 +13557,7 @@ bool js::wasm::WJEmitBody(MIRGenerator& mir, MIRGraph& graph, uint32_t nargs,
   be.propObjLocal = uint32_t(be.reserve(uint8_t(TypeCode::I32)));   // prop-IC: receiver ptr
   be.propShapeLocal = uint32_t(be.reserve(uint8_t(TypeCode::I32)));  // prop-IC: receiver shape
   be.propTaggedLocal = uint32_t(be.reserve(uint8_t(TypeCode::I32)));  // prop-IC: tagged slot offset
+  be.propBVKeyLocal = uint32_t(be.reserve(uint8_t(TypeCode::I32)));  // by-value mega-probe runtime key
   be.propKeyLocal = uint32_t(be.reserve(uint8_t(TypeCode::I64)));  // element-store IC: boxed key
   be.allocPosLocal = uint32_t(be.reserve(uint8_t(TypeCode::I32)));    // inline-alloc old position
   be.allocObjLocal = uint32_t(be.reserve(uint8_t(TypeCode::I32)));    // inline-alloc result obj
@@ -14034,6 +14197,48 @@ bool js::wasm::WJEmitBody(MIRGenerator& mir, MIRGraph& graph, uint32_t nargs,
     // (NOT just loop headers -- crypto-sha1's core_sha1 deopt resumes at pc=272,
     // a mid-loop stack-empty block, not a LoopHead at pc=124/204.)
     static int osrLoopOnly = WJGETENV("GECKO_WJ_OSRLOOPONLY") ? 1 : 0;
+    // OSR-LIVENESS GATE (sound, conservative). OSR jumps into a block, skipping its
+    // dominators (esp. a loop PREHEADER). A def with a PERSISTENT wasm local that is
+    // defined BEFORE the OSR block and used AT/AFTER it (a LICM-hoisted loop-invariant
+    // SSA temp) is un-restored garbage under OSR -- the deopt spill saves only frame
+    // slots (this/args/locals), not SSA-temp locals -- feeding a call_indirect ->
+    // "table index out of bounds" (coffeescript/typescript). Reject such blocks as OSR
+    // targets. Over-rejection is SAFE (fewer OSR sites, never a miscompile); diffcheck
+    // guards under-rejection. GECKO_WJ_OSRNOLIVEGATE disables (A/B). Built only when OSR
+    // is enabled (no default-build cost). block index approximates program order (reloop
+    // numbers dominators lower); a spanning persistent def => the block's dominators are
+    // needed => unsafe to jump straight in.
+    static int osrNoLiveGate = WJGETENV("GECKO_WJ_OSRNOLIVEGATE") ? 1 : 0;
+    std::unordered_map<uint32_t, uint32_t> osrMaxUseBlk;
+    std::vector<std::tuple<MDefinition*, uint32_t, uint32_t>> osrPersistDefs;
+    if (!osrNoLiveGate) {
+      for (uint32_t bi = 0; bi < n; bi++) {
+        MBasicBlock* bb = blocks[bi];
+        for (MInstructionIterator it = bb->begin(); it != bb->end(); it++)
+          for (size_t k = 0; k < (*it)->numOperands(); k++) {
+            uint32_t oid = (*it)->getOperand(k)->id();
+            if (bi > osrMaxUseBlk[oid]) osrMaxUseBlk[oid] = bi;
+          }
+        for (MPhiIterator it = bb->phisBegin(); it != bb->phisEnd(); it++)
+          for (size_t k = 0; k < (*it)->numOperands(); k++) {
+            uint32_t oid = (*it)->getOperand(k)->id();
+            if (bi > osrMaxUseBlk[oid]) osrMaxUseBlk[oid] = bi;
+          }
+      }
+      for (uint32_t bi = 0; bi < n; bi++) {
+        MBasicBlock* bb = blocks[bi];
+        for (MInstructionIterator it = bb->begin(); it != bb->end(); it++)
+          if (be.local(*it) >= 0) {
+            auto mu = osrMaxUseBlk.find((*it)->id());
+            osrPersistDefs.emplace_back(*it, bi, mu == osrMaxUseBlk.end() ? 0 : mu->second);
+          }
+        for (MPhiIterator it = bb->phisBegin(); it != bb->phisEnd(); it++)
+          if (be.local(*it) >= 0) {
+            auto mu = osrMaxUseBlk.find((*it)->id());
+            osrPersistDefs.emplace_back(*it, bi, mu == osrMaxUseBlk.end() ? 0 : mu->second);
+          }
+      }
+    }
     for (uint32_t bi = 0; bi < n; bi++) {
       MBasicBlock* b = blocks[bi];
       if (osrLoopOnly && !b->isLoopHeader()) continue;
@@ -14043,6 +14248,24 @@ bool js::wasm::WJEmitBody(MIRGenerator& mir, MIRGraph& graph, uint32_t nargs,
       const CompileInfo& info = rp->block()->info();
       if (uint32_t(rp->numOperands()) != info.firstStackSlot()) continue;  // depth 0
       uint32_t idx = blockIdx[b];
+      if (!osrNoLiveGate) {
+        // Restored frame-slot defs for this block (this/args/locals rp operands).
+        std::set<uint32_t> restored;
+        restored.insert(rp->getOperand(info.thisSlot())->id());
+        for (uint32_t i = 0; i < info.nargs(); i++)
+          restored.insert(rp->getOperand(info.argSlot(i))->id());
+        for (uint32_t i = 0; i < info.nlocals(); i++)
+          restored.insert(rp->getOperand(info.localSlot(i))->id());
+        bool unsafe = false;
+        for (auto& pd : osrPersistDefs) {
+          uint32_t dblk = std::get<1>(pd), mublk = std::get<2>(pd);
+          if (dblk >= idx || mublk < idx) continue;  // not spanning this block
+          if (restored.count(std::get<0>(pd)->id())) continue;  // restored frame slot
+          unsafe = true;
+          break;
+        }
+        if (unsafe) continue;  // skip: has an un-restored persistent live-in
+      }
       WJAddOsrTarget(uint32_t(rp->pc() - info.script()->code()), idx);
       if (!e.writeOp(Op::I32Const) || !e.writeVarS32(int32_t(blockAddr)) ||
           !e.writeOp(Op::I32Load) || !e.writeVarU32(2) || !e.writeVarU32(0) ||
@@ -14051,6 +14274,27 @@ bool js::wasm::WJEmitBody(MIRGenerator& mir, MIRGraph& graph, uint32_t nargs,
         return false;
       if (!e.writeOp(Op::If) || !e.writeFixedU8(kVoid)) return false;  // if block match
       uint32_t nargs = info.nargs(), nlocals = info.nlocals(), vi = 0;
+      // OSR spill/restore-correspondence dump (GECKO_WJ_OSRMAPDBG): per target
+      // block, log each slot's def opcode/type/target-local so a wrong restore
+      // (the OSR "table index OOB" crash on complex blocks) can be pinned by diffing
+      // against EmitDeoptResumeInline's spill. Compile-time only (no runtime cost).
+      static int osrMapDbg = WJGETENV("GECKO_WJ_OSRMAPDBG") ? 1 : 0;
+      if (osrMapDbg) {
+        uint32_t li = 0;
+        auto logSlot = [&](const char* kind, uint32_t si, MDefinition* d) {
+          fprintf(stderr, "[wj-osrmap]   %s[%u] vi=%u def=%s ty=%s local=%d\n", kind,
+                  si, li++, WJOpName(d->op()), StringFromMIRType(d->type()),
+                  be.local(d));
+        };
+        fprintf(stderr,
+                "[wj-osrmap] %s:%u blk=%u loopHdr=%d nargs=%u nlocals=%u\n",
+                info.script()->filename() ? info.script()->filename() : "?",
+                unsigned(info.script()->lineno()), idx, b->isLoopHeader() ? 1 : 0,
+                nargs, nlocals);
+        logSlot("this", 0, rp->getOperand(info.thisSlot()));
+        for (uint32_t i = 0; i < nargs; i++) logSlot("arg", i, rp->getOperand(info.argSlot(i)));
+        for (uint32_t i = 0; i < nlocals; i++) logSlot("loc", i, rp->getOperand(info.localSlot(i)));
+      }
       if (!EmitOsrLoadSlot(e, be, rp->getOperand(info.thisSlot()), vi++)) return false;
       for (uint32_t i = 0; i < nargs; i++)
         if (!EmitOsrLoadSlot(e, be, rp->getOperand(info.argSlot(i)), vi++))

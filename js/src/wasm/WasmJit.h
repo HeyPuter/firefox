@@ -60,6 +60,13 @@ extern bool WasmJitInWasm();
 // recompiles read the popped fuse and drop the elision.
 extern void WasmJitInvalidateAll(const char* reason);
 
+// Aggregate always-on JIT counters into a JSON string (task #57 __wjStats).
+extern void WJStatsJSON(char* buf, size_t n);
+
+// Throttle for the periodic GECKO_WJ_STATSJSON stderr dump (every Nth JIT run);
+// 0xffffffff = uninitialized, 0 = flag off. See WJStatsDumpTick.
+extern uint32_t gWJStatsEvery;
+
 }  // namespace wasm
 }  // namespace js
 
