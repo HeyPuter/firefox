@@ -1852,6 +1852,14 @@ static void WJCollectRoots(WJBackend& be, MInstruction* ins,
   // Root-kind byte: 0=boxed Value (no re-box), 1=Object, 2=String, 3=Symbol,
   // 4=BigInt (raw cell ptrs re-boxed with their tag at the spill).
   auto add = [&](MDefinition* d, uint8_t kind) {
+    // A GC-thing CONSTANT is already rooted in the traced const pool (gWJConstPool):
+    // every use re-derives it via GetOpInner's isConstant() short-circuit (pool load,
+    // GC-current), never from a stale local. So its GC-root spill here is pure
+    // redundancy -- skip it. (~10% of gbemu root-adds are Constants.) The separate
+    // resume-value spill (EmitSpillValue) still bakes constants for deopt; this only
+    // drops the per-call gWJCallRoots spill. GECKO_WJ_NOCONSTROOTSKIP reverts.
+    static int noSkip = WJGETENV("GECKO_WJ_NOCONSTROOTSKIP") ? 1 : 0;
+    if (!noSkip && d->isConstant()) return;
     int32_t l = be.local(d);
     if (l < 0) return;
     for (uint32_t r = 0; r < rootLocal.size(); r++) {
@@ -1859,6 +1867,26 @@ static void WJCollectRoots(WJBackend& be, MInstruction* ins,
     }
     rootLocal.push_back(uint32_t(l));
     rootIsObj.push_back(kind);
+    // ROOTOPDBG: histogram the DEF OPCODE of each spilled root, to see how many are
+    // rematerializable (pure slot-loads off a rooted receiver) vs not (call results,
+    // arith, phis). Dumped every 200k adds.
+    static int ropdbg = WJGETENV("GECKO_WJ_ROOTOPDBG") ? 1 : 0;
+    if (ropdbg) {
+      static std::unordered_map<uint32_t, uint64_t> opc;
+      static uint64_t tot = 0;
+      opc[uint32_t(d->op())]++;
+      if ((++tot % 5000) == 0) {
+        std::vector<std::pair<uint32_t, uint64_t>> v(opc.begin(), opc.end());
+        std::sort(v.begin(), v.end(),
+                  [](auto& a, auto& b) { return a.second > b.second; });
+        fprintf(stderr, "[wj-rootop] after %llu root-adds:\n",
+                (unsigned long long)tot);
+        for (size_t i = 0; i < v.size() && i < 12; i++)
+          fprintf(stderr, "    %s x%llu\n",
+                  WJOpName(jit::MDefinition::Opcode(v[i].first)),
+                  (unsigned long long)v[i].second);
+      }
+    }
   };
   auto kindOf = [](MIRType t) -> uint8_t {
     switch (t) {

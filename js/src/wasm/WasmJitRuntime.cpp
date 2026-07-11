@@ -759,6 +759,14 @@ bool js::wasm::WasmJitObserveCall(JSScript* script) {
   // promptly regardless of size (that is where the JIT win is + preserves octane/
   // throughput). Deferring only applies to functions that are merely CALLED a lot
   // without looping hot -- the parser-dispatch pattern a one-shot load hits.
+  // NOTE (2026-07-11): a SMALL-FN call-count gate (GECKO_WJ_SMALLLEN/SMALLMULT) was
+  // TRIED here to keep gbemu's net-negative tiny dispatched handlers in PBL, and
+  // REVERTED: it CATASTROPHICALLY regresses benches with hot small NON-LOOPING
+  // methods (richards 2333->102, deltablue 531->91, raytrace 1860->383) because the
+  // loop-warm bypass below does NOT protect call-hot-but-loopless small fns, which
+  // ARE net-positive to compile there. Size+call-count CANNOT distinguish gbemu's
+  // net-negative tiny handlers (net-negative because reached via MEGAMORPHIC fn-ptr
+  // dispatch) from richards' net-positive tiny methods. See gbemu memory.
   if (e.observes < e.nextTry && warm < kLoopWarm) return false;
 
   // NOCOMPILE-lineno-range bisection (GECKO_WJ_NOCOMPILERANGE=lo,hi): refuse to
