@@ -61,6 +61,7 @@
 #include "builtin/Number.h"   // js::NumberParseInt
 #include "builtin/Math.h"     // js::GetUnaryMathFunctionPtr (MMathFunction)
 #include "vm/StringType.h"    // js::ToString, js::EqualStrings
+#include "js/friend/DumpFunctions.h"  // js::DumpBacktrace (GECKO_WJ_VALIDATEHELPER)
 #include "vm/ObjectOperations.h"  // js::HasProperty, js::HasOwnProperty
 #include "vm/Iteration.h"     // js::ValueToIterator, NativeIterator, PropertyIteratorObject
 #include "util/Unicode.h"     // js::unicode::ToLowerCase/ToUpperCase (CharCodeConvertCase)
@@ -142,6 +143,31 @@ uint32_t gWJDeoptByOp[js::wasm::kWJNumOps] = {0};
 uint32_t gWJResumeNArgs[kWJMaxResumeFrames] = {0};
 uint32_t gWJResumeNLocals[kWJMaxResumeFrames] = {0};
 uint32_t gWJResumeValsOff[kWJMaxResumeFrames] = {0};
+uint64_t gWJResumeActuals[js::wasm::kWJMaxArgs] = {0};  // see WasmJitBackend.h
+uint32_t gWJExitFPLastSite = 0;  // task #60 tracer: 1=VMFrame 2=nativeTramp 3=jitFastCall
+uint32_t gWJExitFPSetCount = 0;
+// Known-good exitFP for the CURRENT JIT invocation (task #60): set by
+// WasmJitRunCall from the activation's exitFP at entry (the PBL fast-call site
+// establishes a fresh CallNative exit frame just before, valid for the whole
+// call). wjhelp re-installs it on entry so a GC DURING any helper walks a valid
+// chain even after an exception unwind rewound packedExitFP. Save/restore
+// disciplined around the trampoline call (nesting-safe).
+static uint8_t* gWJEntryExitFP = nullptr;
+static void* gWJEntryAct = nullptr;
+extern "C" uint32_t WJExitFPDbgState(uint32_t* cnt) {
+  if (cnt) *cnt = gWJExitFPSetCount;
+  return gWJExitFPLastSite;
+}
+// Record an exitFP install from OUTSIDE the wasm TU (FrameIter unwind sites).
+extern "C" void WJExitFPDbgRecord(int siteId, void* v) {
+  static const char* e = getenv("GECKO_WJ_EXITFPDBG");
+  static uintptr_t target = e ? strtoul(e, nullptr, 0) : 0;
+  if (target && uintptr_t(v) == target) {
+    gWJExitFPLastSite = uint32_t(siteId);
+    gWJExitFPSetCount++;
+  }
+}
+uint32_t gWJResumeActualArgc = 0;
 uint64_t gWJCallCallee = 0;     // boxed callee Value (set by emitted code)
 uint32_t gWJCallArgc = 0;
 uint64_t gWJConstructNewTarget = 0;  // boxed newTarget for constructing calls
@@ -489,6 +515,59 @@ static uint32_t WarmupDelay() {
 }  // namespace
 
 bool js::wasm::WasmJitInWasm() { return js::wasm::gWJExecDepth > 0; }
+
+void js::wasm::WasmJitInvalidateAll(const char* reason) {
+  uint32_t n = 0;
+  if (gEntries) {
+    for (auto& kv : *gEntries) {
+      WJEntry& e = kv.second;
+      if (e.state != WJEntry::State::Compiled) continue;
+      e.state = WJEntry::State::Cold;
+      e.handle = -1;
+      e.tblSlot = -1;
+      e.directIdx = -1;
+      e.observes = 0;
+      e.nextTry = 0;
+      e.osrTargets.clear();
+      n++;
+    }
+  }
+  // Stale call-IC entries would dispatch to the abandoned table slots; clearing
+  // the callee-ptr side is sufficient (tblIdx is only read on a fn-ptr hit).
+  // NOTE: a JIT frame already ON THE STACK when the fuse pops finishes with the
+  // old (elided) code, like a non-bailing Ion frame would -- acceptable for the
+  // rare mid-flight pop; new calls all re-enter PBL and recompile fresh.
+  memset(gWJCallFn, 0, sizeof(uint32_t) * kWJCallSites * kWJCallWays);
+  static int dbg = getenv("GECKO_WJ_INVALDBG") ? 1 : 0;
+  if (dbg)
+    fprintf(stderr, "[wj-invalidate-all] reason=%s flushed=%u\n", reason, n);
+}
+
+// Cheap routing pre-check for the PBL call fast path (task #60): 0 = not
+// JIT-able (take the PBL fast path), 1 = already compiled (route to the IC,
+// no compile possible), 2 = a synchronous COMPILE may run inside
+// WasmJitObserveCall -- the caller must establish a covering exit frame first
+// (the compile allocates; a GC with no valid exitFP leaves PBL frames
+// untraced). Mirrors WasmJitObserveCall's head checks; one hash lookup.
+int js::wasm::WasmJitPreCall(JSScript* script) {
+  static int sEnabled = -1;
+  if (sEnabled < 0) sEnabled = getenv("GECKO_NOWASMJIT") ? 0 : 1;
+  if (!sEnabled) return 0;
+  static uint32_t sMaxLen2 = 0;
+  if (!sMaxLen2) {
+    const char* s = getenv("GECKO_WJ_MAXLEN");
+    sMaxLen2 = s ? uint32_t(atoi(s)) : 4096;
+    if (!sMaxLen2) sMaxLen2 = 4096;
+  }
+  if (!script->function() || script->isModule() ||
+      script->length() > sMaxLen2) {
+    return 0;
+  }
+  WJEntry& e = EntryFor(script);
+  if (e.state == WJEntry::State::Compiled) return 1;
+  if (e.state == WJEntry::State::Failed) return 0;
+  return 2;
+}
 
 bool js::wasm::WasmJitObserveCall(JSScript* script) {
   static int sEnabled = -1;
@@ -1051,6 +1130,21 @@ int js::wasm::WasmJitRunCall(JSScript* script, uint64_t thisBits,
   double flag;
   gWJDidResume = false;
   gWJExecDepth++;
+  // Record the entry-time exitFP + activation for wjhelp's re-install (task #60);
+  // nesting-safe via save/restore around the call.
+  uint8_t* wjPrevEntryExitFP = gWJEntryExitFP;
+  void* wjPrevEntryAct = gWJEntryAct;
+  {
+    JSContext* ecx = js::TlsContext.get();
+    js::Activation* eact = ecx ? ecx->activation() : nullptr;
+    if (eact && eact->isJit()) {
+      gWJEntryExitFP = eact->asJit()->jsExitFP();
+      gWJEntryAct = (void*)eact;
+    } else {
+      gWJEntryExitFP = nullptr;
+      gWJEntryAct = nullptr;
+    }
+  }
   if (e.directIdx >= 0) {
     typedef double (*WJTrampFn)(double);
     WJTrampFn fp = reinterpret_cast<WJTrampFn>(uintptr_t(e.directIdx));
@@ -1058,6 +1152,8 @@ int js::wasm::WasmJitRunCall(JSScript* script, uint64_t thisBits,
   } else {
     flag = wasmhost_call(e.handle, 0, &ptr, 1);
   }
+  gWJEntryExitFP = wjPrevEntryExitFP;
+  gWJEntryAct = wjPrevEntryAct;
   gWJExecDepth--;
   // Convention: 0.0 = result ready in gWJScratch (normal completion OR sound
   // resume); 1.0 = an exception is pending (a call/resume threw) -> propagate;
@@ -1158,9 +1254,9 @@ int js::wasm::WasmJitRunCall(JSScript* script, uint64_t thisBits,
     // caller "I didn't run it" so PBL RE-RUNS the function from pc=0, DUPLICATING the
     // side effects (hash-map _createHashedEntry ran twice -> 2 orphan entries -> result
     // 210 short; minimal repro /tmp/seh_repro.js SEH=50002). So return the completed
-    // result (return 1) even when the valve fires. GECKO_WJ_NOVALVERESULT reverts.
+    // result (return 1) even when the valve fires.
     auto valveReturn = [&]() -> int {
-      static int noVR = getenv("GECKO_WJ_NOVALVERESULT") ? 1 : 0;
+      constexpr int noVR = 0;  // valve-result fix is permanent
       if (noVR) return 0;
       *retBits = gWJScratch[js::wasm::kWJResultSlot];
       return 1;
@@ -1620,8 +1716,121 @@ static void WJDumpVTraceAtExit() {
 }
 
 static double wjhelpImpl(double kindF, double siteF);
+// Crash forensics: the last helper kind/site entered, readable AFTER a wasm trap
+// kills the instance (the embed process survives; __exec calls WJDumpCrashState).
+// One i32 store per helper call -- negligible next to the call itself.
+static volatile uint32_t gWJLastHelpKind = 0;
+static volatile uint32_t gWJLastHelpSite = 0;
+extern "C" void WJDumpWalkRing();  // JitFrames.cpp (task #60)
+extern "C" EMSCRIPTEN_KEEPALIVE void WJDumpCrashState() {
+  WJDumpWalkRing();
+  fprintf(stderr,
+          "[wj-crashstate] lastHelpKind=%u lastHelpSite=%u callArgc=%u "
+          "execDepth=%d rootSP=%u resumeActive=%d\n",
+          gWJLastHelpKind, gWJLastHelpSite, gWJCallArgc, gWJExecDepth,
+          gWJRootSP, int(gWJResumeActive));
+  // Mid-resume crash (resumeActive=1): the gWJResume* globals still describe the
+  // crashing resume -- print each frame's identity (fn, pc, JSOp, layout) so the
+  // deopt site is named without a re-run. Guard the script pointer (may be
+  // garbage if the spill itself was corrupt).
+  if (gWJResumeActive && gWJResumeNFrames &&
+      gWJResumeNFrames <= js::wasm::kWJMaxResumeFrames) {
+    for (uint32_t f = 0; f < gWJResumeNFrames; f++) {
+      JSScript* ds =
+          reinterpret_cast<JSScript*>(uintptr_t(gWJResumeScriptPtr[f]));
+      const char* fn = "?";
+      unsigned ln = 0;
+      const char* opname = "?";
+      if (ds && js::gc::IsCellPointerValid(ds)) {
+        fn = ds->filename() ? ds->filename() : "?";
+        ln = unsigned(ds->lineno());
+        if (gWJResumePc[f] < ds->length())
+          opname = js::CodeName(JSOp(*(ds->code() + gWJResumePc[f])));
+      }
+      fprintf(stderr,
+              "[wj-crashstate] resume frame%u/%u %s:%u pc=%u op=%s depth=%u "
+              "nargs=%u nlocals=%u off=%u\n",
+              f, gWJResumeNFrames, fn, ln, gWJResumePc[f], opname,
+              gWJResumeStackDepth[f], gWJResumeNArgs[f], gWJResumeNLocals[f],
+              gWJResumeValsOff[f]);
+    }
+    fprintf(stderr,
+            "[wj-crashstate] lastDeoptOp=%s(%u) valsCount=%u actualArgc=%u\n",
+            js::wasm::WJMirOpName(gWJLastDeoptOp), gWJLastDeoptOp,
+            gWJResumeValsCount, gWJResumeActualArgc);
+    // Decode each spilled Value: raw bits, cell validity, and for strings the
+    // header (flags/length/rope-ness + child validity). Distinguishes "slot
+    // holds a stale/garbage pointer" from "valid rope whose CHILDREN are
+    // stale" -- the latter means the rope was BUILT from stale operands.
+    uint32_t nv = gWJResumeValsCount <= 32 ? gWJResumeValsCount : 32;
+    for (uint32_t i = 0; i < nv; i++) {
+      JS::Value v = JS::Value::fromRawBits(gWJResumeVals[i]);
+      if (!v.isGCThing()) continue;
+      js::gc::Cell* cell = v.toGCThing();
+      bool valid = js::gc::IsCellPointerValid(cell);
+      fprintf(stderr, "[wj-crashstate] vals[%u]=%016llx kind=%s cellValid=%d",
+              i, (unsigned long long)gWJResumeVals[i],
+              v.isString() ? "str" : v.isObject() ? "obj" : "gc", int(valid));
+      if (valid && v.isString()) {
+        JSString* s = v.toString();
+        fprintf(stderr, " len=%zu rope=%d", s->length(), int(!s->isLinear()));
+        if (!s->isLinear()) {
+          JSRope* r = &s->asRope();
+          JSString* lc = r->leftChild();
+          JSString* rc = r->rightChild();
+          fprintf(stderr, " lc=%p(v=%d) rc=%p(v=%d)", (void*)lc,
+                  int(js::gc::IsCellPointerValid(lc)), (void*)rc,
+                  int(js::gc::IsCellPointerValid(rc)));
+        }
+      }
+      fprintf(stderr, "\n");
+    }
+  }
+  // Prop-IC crash: name the property + the staged receiver bits (identifies the
+  // source access; scratch[0] is the object the JIT staged for the miss path).
+  if (gWJLastHelpKind == js::wasm::WJH_PROPIC ||
+      gWJLastHelpKind == js::wasm::WJH_SETPROPIC) {
+    uint32_t site = gWJLastHelpSite;
+    JS::PropertyKey id = JS::PropertyKey::fromRawBits(uintptr_t(gWJPropKey[site]));
+    if (id.isAtom()) {
+      JSAtom* a = id.toAtom();
+      char buf[64] = {0};
+      size_t n = 0;
+      if (a->hasLatin1Chars()) {
+        JS::AutoCheckCannotGC nogc;
+        const JS::Latin1Char* ch = a->latin1Chars(nogc);
+        for (; n < a->length() && n < 63; n++) buf[n] = char(ch[n]);
+      }
+      fprintf(stderr, "[wj-crashstate] propic key='%s' scratch0=%016llx\n", buf,
+              (unsigned long long)gWJScratch[0]);
+    } else {
+      fprintf(stderr, "[wj-crashstate] propic key=<non-atom> scratch0=%016llx\n",
+              (unsigned long long)gWJScratch[0]);
+    }
+  }
+}
 extern "C" EMSCRIPTEN_KEEPALIVE double wjhelp(double kindF, double siteF) {
+  gWJLastHelpKind = uint32_t(kindF);
+  gWJLastHelpSite = uint32_t(siteF);
+  // Save + restore the activation's jsExitFP around EVERY helper: a helper that
+  // runs JS (WJH_CALL/RESUME/getters) executes PBL whose VMFrame dtors pop their
+  // exit frames WITHOUT restoring jsExitFP -- benign inside PBL (the next VMFrame
+  // re-sets it) but fatal once control returns to wasm-JIT code and a later
+  // helper GCs: TraceJitFrames then walks the stale exitFP into reused stack
+  // holding boxed values (the GCZeal deep-chain crash, task #60). Restoring here
+  // puts back the OUTER entry's still-valid exit frame.
+  JSContext* wjcx = js::TlsContext.get();
+  js::Activation* wjact = wjcx ? wjcx->activation() : nullptr;
+  uint8_t* wjSavedExitFP =
+      (wjact && wjact->isJit()) ? wjact->asJit()->jsExitFP() : nullptr;
+  if (wjact && wjact->isJit() && gWJEntryExitFP &&
+      (void*)wjact == gWJEntryAct) {
+    wjact->asJit()->setJSExitFP(gWJEntryExitFP);
+  }
   double r = wjhelpImpl(kindF, siteF);
+  if (wjact && wjact->isJit() && wjSavedExitFP) {
+    wjact->asJit()->setJSExitFP(wjSavedExitFP);
+  }
   // Contract check (GECKO_WJ_DEPTHDBG): 1.0 means "threw" -- returning it with
   // NO pending exception surfaces as an undebuggable silent failure.
   static int helpDbg = getenv("GECKO_WJ_DEPTHDBG") ? 1 : 0;
@@ -1636,6 +1845,82 @@ extern "C" EMSCRIPTEN_KEEPALIVE double wjhelp(double kindF, double siteF) {
 }
 static double wjhelpImpl(double kindF, double siteF) {
   int kind = int(kindF);
+  // DEBUG (GECKO_WJ_VALIDATEHELPER): validate GC-tagged Values staged in the
+  // scratch slots (and the call callee) on EVERY helper entry. Catches a stale
+  // pointer at the moment JIT'd code hands it to the runtime -- with the full
+  // JS backtrace -- instead of crashing far downstream (task #64: terser rope
+  // corruption observed 3 frames away from its source). Ropes also get their
+  // children checked (a rope BUILT from a stale operand has garbage kids).
+  static int validateHelper = getenv("GECKO_WJ_VALIDATEHELPER") ? 1 : 0;
+  if (validateHelper) {
+    auto bad = [&](uint64_t bits, const char* what, int slot) {
+      JS::Value v = JS::Value::fromRawBits(bits);
+      if (!v.isGCThing()) return false;
+      js::gc::Cell* cell = v.toGCThing();
+      if (!js::gc::IsCellPointerValid(cell)) return true;
+      if (v.isString() && !v.toString()->isLinear()) {
+        JSRope* r = &v.toString()->asRope();
+        if (!js::gc::IsCellPointerValid(r->leftChild()) ||
+            !js::gc::IsCellPointerValid(r->rightChild()))
+          return true;
+      }
+      return false;
+    };
+    // Only kinds whose scratch slots are freshly staged (leftover slots from
+    // earlier calls are stale BY DESIGN -- checking them would false-positive).
+    int nCheck = 0;
+    switch (kind) {
+      case js::wasm::WJH_CALL: nCheck = int(gWJCallArgc); break;
+      case js::wasm::WJH_BINARYARITH:
+      case js::wasm::WJH_COMPARE:
+      case js::wasm::WJH_SETPROPIC:
+      case js::wasm::WJH_CHARCODEAT: nCheck = 2; break;
+      case js::wasm::WJH_PROPIC:
+      case js::wasm::WJH_LINEARIZE:
+      case js::wasm::WJH_TOSTRING: nCheck = 1; break;
+      default: nCheck = 0; break;
+    }
+    bool hit = false;
+    for (int i = 0; i < nCheck && i < 62; i++)
+      if (bad(gWJScratch[i], "scratch", i)) {
+        fprintf(stderr, "[wj-validate] STALE scratch[%d]=%016llx kind=%d site=%d\n",
+                i, (unsigned long long)gWJScratch[i], kind, int(siteF));
+        hit = true;
+      }
+    if (kind == js::wasm::WJH_CALL && bad(gWJCallCallee, "callee", -1)) {
+      fprintf(stderr, "[wj-validate] STALE callee=%016llx\n",
+              (unsigned long long)gWJCallCallee);
+      hit = true;
+    }
+    if (hit) {
+      if (kind == js::wasm::WJH_CALL)
+        fprintf(stderr, "[wj-validate] caller line=%u (gWJCallSiteLine[site])\n",
+                gWJCallSiteLine[uint32_t(siteF) % js::wasm::kWJCallSites]);
+      JSContext* vcx = js::TlsContext.get();
+      if (vcx) js::DumpBacktrace(vcx);
+      abort();
+    }
+  }
+  if (kind == 252) {  // WJH_CHECKVAL (GECKO_WJ_VALSTORE): validate a to-be-stored
+    // Value in gWJHelpVal; siteF = the storing fn's script line. Abort on stale.
+    JS::Value v = JS::Value::fromRawBits(gWJHelpVal);
+    bool badv = false;
+    if (v.isGCThing()) {
+      js::gc::Cell* c = v.toGCThing();
+      badv = !js::gc::IsCellPointerValid(c);
+      if (!badv && v.isString() && !v.toString()->isLinear()) {
+        JSRope* r = &v.toString()->asRope();
+        badv = !js::gc::IsCellPointerValid(r->leftChild()) ||
+               !js::gc::IsCellPointerValid(r->rightChild());
+      }
+    }
+    if (badv) {
+      fprintf(stderr, "[wj-valstore] STALE stored value=%016llx line=%d defId=%u\n",
+              (unsigned long long)gWJHelpVal, int(siteF), gWJHelpSlot);
+      abort();
+    }
+    return 0.0;
+  }
   if (kind == 250) {  // WJH_TRACE: record siteF in the ring buffer. NB: kind 250 is a
     // dedicated sentinel -- it MUST NOT collide with any WJHelpKind enum value.
     // (Was 40, which COLLIDED with WJH_ISARRAY=40: every Array.isArray hit this
@@ -1643,6 +1928,22 @@ static double wjhelpImpl(double kindF, double siteF) {
     // Array.isArray, breaking ubo/webtooling. 2026-07-02 fix.)
     if (!gWJTraceBuf) { gWJTraceBuf = new uint32_t[kWJTraceN](); atexit(WJDumpTraceAtExit); }
     gWJTraceBuf[gWJTraceCount++ & (kWJTraceN - 1)] = uint32_t(int64_t(siteF));
+    return 0.0;
+  }
+  if (kind == 252) {  // ARGC0DBG trap: a usesArgc fn entered with a ZERO argc snapshot.
+    static uint64_t n = 0;
+    if (n++ < 12) {
+      JS::Value cal = JS::Value::fromRawBits(gWJCallCallee);
+      JSFunction* cf = cal.isObject() && cal.toObject().is<JSFunction>()
+                           ? &cal.toObject().as<JSFunction>() : nullptr;
+      JSScript* cs = cf && cf->hasBaseScript() && cf->baseScript()->hasBytecode()
+                         ? static_cast<JSScript*>(cf->baseScript()) : nullptr;
+      fprintf(stderr,
+              "[wj-argc0] gWJCallArgc=%u callee=%s:%u execDepth=%d env=%u\n",
+              gWJCallArgc,
+              cs && cs->filename() ? cs->filename() : "?",
+              cs ? unsigned(cs->lineno()) : 0, gWJExecDepth, gWJCurrentEnv);
+    }
     return 0.0;
   }
   if (kind == 251) {  // WJH_VTRACE: record (defId=siteF, gWJTraceVal). See value tracer.
@@ -1724,7 +2025,8 @@ static double wjhelpImpl(double kindF, double siteF) {
                 (unsigned long long)dc);
         for (uint32_t o = 0; o < js::wasm::kWJNumOps; o++)
           if (gWJDeoptByOp[o])
-            fprintf(stderr, "[wb-deopthist]   op#%u = %u\n", o, gWJDeoptByOp[o]);
+            fprintf(stderr, "[wb-deopthist]   %s(op#%u) = %u\n",
+                    js::wasm::WJMirOpName(o), o, gWJDeoptByOp[o]);
       }
     }
     if (stormLine) {
@@ -1762,6 +2064,41 @@ static double wjhelpImpl(double kindF, double siteF) {
     // (normal) deopt. Used for the innermost frame below.
     const uint32_t resumeErr = gWJResumeInError;
     gWJResumeInError = 0;
+    // Beyond-formal actuals graft (see the backend spill): the PHYSICAL (outermost)
+    // frame was spilled with only its formals in the arg region; if the function
+    // entered with MORE actuals (arguments-using variadic), widen that region with
+    // the staged actuals so the PBL frame sees the true argc (arguments.length /
+    // arguments[i] beyond formals). Pure bit-moves inside the traced buffer, done
+    // BEFORE any allocation. Consumes gWJResumeActualArgc.
+    {
+      uint32_t aa = gWJResumeActualArgc;
+      gWJResumeActualArgc = 0;
+      uint32_t lf = nframes - 1;
+      uint32_t na = gWJResumeNArgs[lf];
+      static int graftDbg = getenv("GECKO_WJ_GRAFTDBG") ? 1 : 0;
+      if (graftDbg) {
+        static uint64_t gn = 0;
+        if (gn++ < 60)
+          fprintf(stderr,
+                  "[wj-graft] aa=%u na=%u lf=%u off=%u nlocals=%u depth=%u pc=%u\n",
+                  aa, na, lf, gWJResumeValsOff[lf], gWJResumeNLocals[lf],
+                  gWJResumeStackDepth[lf], gWJResumePc[lf]);
+      }
+      if (aa > na && aa <= js::wasm::kWJMaxArgs) {
+        uint32_t shift = aa - na;
+        uint32_t base = gWJResumeValsOff[lf] + 1 + na;
+        uint32_t end = gWJResumeValsOff[lf] + 1 + na + gWJResumeNLocals[lf] +
+                       gWJResumeStackDepth[lf];
+        if (end + shift <= 1024) {
+          memmove(&gWJResumeVals[base + shift], &gWJResumeVals[base],
+                  size_t(end - base) * 8);
+          for (uint32_t i = na; i < aa; i++) {
+            gWJResumeVals[gWJResumeValsOff[lf] + 1 + i] = gWJResumeActuals[i];
+          }
+          gWJResumeNArgs[lf] = aa;
+        }
+      }
+    }
     // Mark gWJResumeVals as a live GC-root region for the whole resume: the spilled
     // boxed pointers must survive the allocations (RootedValueVector reserve, PBL
     // frame setup, per-frame GC) between the deopt spill and the read of each frame's
@@ -1810,8 +2147,12 @@ static double wjhelpImpl(double kindF, double siteF) {
             reinterpret_cast<JSScript*>(uintptr_t(gWJResumeScriptPtr[0]));
         if (dscript) {
           WJEntry& de = EntryFor(dscript);
+          // Skip OSR when the actuals graft WIDENED the arg region
+          // (gWJResumeNArgs[0] > compile-time nargs): the prologue restore
+          // reads [this, nargs args, locals] at the compile-time layout, so a
+          // widened frame would shift every local read.
           if (de.state == WJEntry::State::Compiled && de.directIdx >= 0 &&
-              !de.osrTargets.empty()) {
+              !de.osrTargets.empty() && gWJResumeNArgs[0] == de.nargs) {
             uint32_t pc = gWJResumePc[0];
             int blk = -1;
             for (auto& t : de.osrTargets)
@@ -1882,8 +2223,8 @@ static double wjhelpImpl(double kindF, double siteF) {
       // wrong scope -> aliased-var reads return garbage ("undefined is not a function"
       // in ubo's CSS generator: a closure read its sibling `let` from the function env
       // instead of the block env). Now that the spill is EmitObjPtr(RP env operand)
-      // (reliable), keep it whenever present. GECKO_WJ_NOKEEPENV reverts to Init.
-      static int noKeepEnv = getenv("GECKO_WJ_NOKEEPENV") ? 1 : 0;
+      // (reliable), keep it whenever present.
+      constexpr int noKeepEnv = 0;  // keep-frame-env resume fix is permanent
       bool keepFrameEnv = !noKeepEnv && (gWJResumeEnvPtr[f] != 0);
       uint32_t nargs = gWJResumeNArgs[f];
       uint32_t nlocals = gWJResumeNLocals[f];
@@ -2002,6 +2343,25 @@ static double wjhelpImpl(double kindF, double siteF) {
                        sv.isUndefined() ? "undef" : sv.isNull() ? "null" : sv.isObject()
                        ? (sv.toObject().is<JSFunction>() ? "fn" : "obj") : "prim");
         }
+        // GECKO_WJ_RESUMEDISAS: walk the bytecode from the resume pc so the exact
+        // resumed op sequence is visible (no disassembler native in the embed).
+        static int rdisas = getenv("GECKO_WJ_RESUMEDISAS") ? 1 : 0;
+        if (rdisas) {
+          jsbytecode* p = script->code() + gWJResumePc[f];
+          jsbytecode* endp = script->codeEnd();
+          fprintf(stderr, "\n  [ops]");
+          for (int k = 0; k < 25 && p < endp; k++) {
+            JSOp jop = JSOp(*p);
+            fprintf(stderr, " %u:%s", unsigned(p - script->code()),
+                    js::CodeName(jop));
+            p += js::GetBytecodeLength(p);
+          }
+          for (uint32_t i = 0; i < nlocals && i < 8; i++) {
+            JS::Value lv = vals[1 + nargs + i];
+            fprintf(stderr, " Lbits%u=%016llx", i,
+                    (unsigned long long)lv.asRawBits());
+          }
+        }
         // montReduce x_array sanity: S0=x_array(obj), S1=write index. Flag if the
         // index is out of the dense range or the array length looks corrupt.
         if (getenv("GECKO_WJ_XARRDBG") && depth >= 2) {
@@ -2017,6 +2377,26 @@ static double wjhelpImpl(double kindF, double siteF) {
           }
         }
         fprintf(stderr, "\n");
+      }
+      // GECKO_WJ_RESARRDBG: inspect the dense elements of local L0 (the result
+      // array in the reloop repros) at resume ENTRY, and again on the resume's
+      // return value below -- splits "array corrupted before the resume" from
+      // "corrupted by the resume".
+      static int resArrDbg = getenv("GECKO_WJ_RESARRDBG") ? 1 : 0;
+      if (resArrDbg && nlocals > 0) {
+        JS::Value l0 = vals[1 + nargs];
+        if (l0.isObject() && l0.toObject().is<js::NativeObject>()) {
+          js::NativeObject* no = &l0.toObject().as<js::NativeObject>();
+          uint32_t il = no->getDenseInitializedLength();
+          int selfIdx = -1;
+          for (uint32_t i2 = 0; i2 < il; i2++) {
+            const JS::Value& ev = no->getDenseElement(i2);
+            if (ev.isObject() && &ev.toObject() == &l0.toObject()) { selfIdx = int(i2); break; }
+          }
+          uint64_t lastBits = il ? no->getDenseElement(il - 1).asRawBits() : 0;
+          fprintf(stderr, "[wj-resarr] PRE il=%u last=%016llx selfIdx=%d\n", il,
+                  (unsigned long long)lastBits, selfIdx);
+        }
       }
       // try/catch: error-mode resume for the innermost (throwing) frame -> PBL runs the
       // catch via HandleException. gWJResumeInError was set by emitted code before this
@@ -2038,6 +2418,21 @@ static double wjhelpImpl(double kindF, double siteF) {
                   dcx ? int(JS_IsExceptionPending(dcx)) : -1);
         }
         return 1.0;  // resumed execution threw (uncaught) -> propagate
+      }
+      if (resArrDbg) {
+        JS::Value rv = JS::Value::fromRawBits(rbits);
+        if (rv.isObject() && rv.toObject().is<js::NativeObject>()) {
+          js::NativeObject* no = &rv.toObject().as<js::NativeObject>();
+          uint32_t il = no->getDenseInitializedLength();
+          int selfIdx = -1;
+          for (uint32_t i2 = 0; i2 < il; i2++) {
+            const JS::Value& ev = no->getDenseElement(i2);
+            if (ev.isObject() && &ev.toObject() == &rv.toObject()) { selfIdx = int(i2); break; }
+          }
+          uint64_t lastBits = il ? no->getDenseElement(il - 1).asRawBits() : 0;
+          fprintf(stderr, "[wj-resarr] POST il=%u last=%016llx selfIdx=%d\n", il,
+                  (unsigned long long)lastBits, selfIdx);
+        }
       }
       static int db414 = getenv("GECKO_WJ_DB414") ? atoi(getenv("GECKO_WJ_DB414")) : -1;
       if (db414 >= 0 && uint32_t(script->lineno()) == uint32_t(db414)) {
@@ -4009,7 +4404,21 @@ static double wjhelpImpl(double kindF, double siteF) {
     RootedObject obj(cx, &objv.toObject());
     RootedValue idx(cx, JS::Value::fromRawBits(gWJScratch[1]));
     RootedValue val(cx, JS::Value::fromRawBits(gWJScratch[2]));
-    bool strict = (int(siteF) != 0);
+    // Site word: bit0 strict, bit1 property-INIT (define) semantics, attrs<<2.
+    // Init ops (InitElem/InitProp families) must DEFINE: mirrors the Baseline
+    // SetElem fallback's InitElemOperation (ToPropertyKey + DefineDataProperty
+    // with the op's attrs) -- an OOB typed-array define THROWS where a set
+    // silently skips (jit-test typedarray/define-property-oob).
+    uint32_t hsite = uint32_t(siteF);
+    if (hsite & 2) {
+      RootedId id(cx);
+      if (!js::ToPropertyKey(cx, idx, &id)) return 1.0;
+      unsigned attrs = hsite >> 2;
+      if (!js::DefineDataProperty(cx, obj, id, val, attrs)) return 1.0;
+      gWJScratch[js::wasm::kWJResultSlot] = val.asRawBits();
+      return 0.0;
+    }
+    bool strict = (hsite & 1) != 0;
     if (!js::SetObjectElement(cx, obj, idx, val, strict)) return 1.0;
     gWJScratch[js::wasm::kWJResultSlot] = val.asRawBits();
     return 0.0;
@@ -4699,6 +5108,9 @@ extern "C" EMSCRIPTEN_KEEPALIVE void WJTraceRoots(JSTracer* trc, void*) {
       JS::TraceRoot(trc, reinterpret_cast<JS::Value*>(&gWJResumeVals[i]),
                     "wjresumeval");
     }
+    // gWJResumeActuals is NOT traced: the graft consumes it into gWJResumeVals
+    // (traced) before any allocation, and stale slots from earlier deopts may
+    // hold dangling pointers (tracing them crashed the object-args repro).
   }
   if (rootLogM && trc->kind() != JS::TracerKind::Marking)
     fprintf(stderr, "[wjrootlog] === WJTraceRoots DONE ===\n");

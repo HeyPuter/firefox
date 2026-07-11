@@ -10,6 +10,7 @@
 #include "vm/JSContext.h"
 #include "vm/JSScript.h"
 #include "vm/Logging.h"
+#include "wasm/WasmJit.h"
 
 #include "gc/StableCellHasher-inl.h"
 #include "vm/JSScript-inl.h"
@@ -42,6 +43,9 @@ void js::InvalidatingRuntimeFuse::popFuse(JSContext* cx) {
   // Pop the fuse in the base class
   GuardFuse::popFuse(cx);
   JS_LOG(fuseInvalidation, Verbose, "Invalidating fuse popping: %s", name());
+  // The wasm-JIT registers no per-script fuse dependencies; flush all its
+  // installed code so recompiles read the popped fuse (see WasmJit.h).
+  js::wasm::WasmJitInvalidateAll(name());
   // do invalidation.
   for (AllZonesIter z(cx->runtime()); !z.done(); z.next()) {
     // There's one dependent script set per fuse; just iterate over them all to

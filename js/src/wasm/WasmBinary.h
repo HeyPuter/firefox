@@ -200,6 +200,10 @@ class Encoder {
   }
 
   size_t currentOffset() const { return bytes_.length(); }
+
+  // JS->wasm JIT: roll back a partially-emitted region (the relooper attempt
+  // falls back to the dispatch-loop emitter on a structuring failure).
+  void wjShrinkTo(size_t offset) { bytes_.shrinkTo(offset); }
   const uint8_t* peekBytes() const { return bytes_.begin(); }
   bool empty() const { return currentOffset() == 0; }
 

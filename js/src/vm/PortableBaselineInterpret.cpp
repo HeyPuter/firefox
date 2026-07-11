@@ -77,11 +77,14 @@ namespace wasm {
 // caller then misses the PBL fast path so the call goes through the IC). RunCall
 // runs that wasm version from the IC when the args are numbers.
 extern bool WasmJitObserveCall(JSScript* script);
+extern int WasmJitPreCall(JSScript* script);  // 0=no-jit 1=compiled 2=may-compile
 extern int WasmJitRunCall(JSScript* script, uint64_t thisBits,
                           const JS::Value* args, uint32_t argc,
                           JSObject* envChain, uint64_t* retBits);
 // Boxed RUNTIME callee for the JIT entry (MCallee rooting; see WasmJitBackend.cpp).
 extern uint64_t gWJCallCallee;
+extern uint32_t gWJExitFPLastSite;  // task #60 exitFP setter tracer
+extern uint32_t gWJExitFPSetCount;
 }  // namespace wasm
 }  // namespace js
 #endif
@@ -123,6 +126,19 @@ static const bool kHybridICsInterp = PBL_HYBRID_ICS_DEFAULT;
 // script->function()->environment() being used for a re-instantiated closure.
 // Single-threaded shell; cleared on consume so nested frames don't inherit it.
 static JSObject* gPBLResumeEnclosingEnv = nullptr;
+// GECKO_WJ_EXITFPDBG=<decimal addr>: print every setter that installs the target
+// exitFP value (task #60: the zeal crash's stale exitFP is address-deterministic).
+static inline void WJExitFPDbg(int siteId, void* v) {
+  static const char* e = getenv("GECKO_WJ_EXITFPDBG");
+  static uintptr_t target = e ? strtoul(e, nullptr, 0) : 0;
+  if (MOZ_UNLIKELY(target != 0) && uintptr_t(v) == target) {
+    js::wasm::gWJExitFPLastSite = uint32_t(siteId);
+    js::wasm::gWJExitFPSetCount++;
+  }
+}
+// GECKO_WJ_RESUMETRACE=<n>: trace the first n ops of the FIRST JIT-deopt-resumed
+// frame (op name + pc offset + stack top) -- diagnosing resume misexecution.
+static int gPBLWJResumeTraceN = 0;
 // When true, the resumed frame was pushed with the CAPTURED deopt-time frame env
 // (gWJResumeEnvPtr -- the actual env at the deopt, including any own CallObject
 // the JIT already created/populated). The prologue must KEEP it and NOT re-run
@@ -463,6 +479,7 @@ class VMFrame {
   Stack& stack;
   StackVal* exitFP;
   void* prevSavedStack;
+  uint8_t* prevExitFP;
 
  public:
   VMFrame(VMFrameManager& mgr, Stack& stack_, StackVal* sp)
@@ -471,7 +488,16 @@ class VMFrame {
     if (!exitFP) {
       return;
     }
+    // Save + RESTORE (dtor) the previous exitFP: leaving it pointing at this
+    // POPPED frame was benign in pure PBL (a GC can only happen inside some
+    // VMFrame, which re-sets it) but fatal with the JS->wasm JIT, whose compile/
+    // helper paths GC outside any VMFrame -- the stale exitFP then points at
+    // reused stack holding boxed values and TraceJitFrames walks garbage (the
+    // GCZeal deep-chain crash, task #60). Restoring keeps the invariant
+    // "exitFP always points at a live frame (the enclosing VMFrame's)".
+    prevExitFP = cx->activation()->asJit()->jsExitFP();
     cx->activation()->asJit()->setJSExitFP(reinterpret_cast<uint8_t*>(exitFP));
+    WJExitFPDbg(1, exitFP);
     prevSavedStack = cx->portableBaselineStack().top;
     cx->portableBaselineStack().top = reinterpret_cast<void*>(spBelowFrame());
   }
@@ -484,6 +510,7 @@ class VMFrame {
   ~VMFrame() {
     stack.popExitFrame(exitFP);
     cx->portableBaselineStack().top = prevSavedStack;
+    cx->activation()->asJit()->setJSExitFP(prevExitFP);
   }
 
   JSContext* getCx() const { return cx; }
@@ -2430,6 +2457,14 @@ uint64_t ICInterpretOps(uint64_t arg0, uint64_t arg1, ICStub* stub,
             // We *also* need an exit frame (the native baseline
             // execution would invoke a trampoline here).
             StackVal* trampolinePrevFP = ctx.stack.fp;
+            // Save + RESTORE jsExitFP around the native call: leaving it pointing
+            // at this popped trampoline frame is harmless in pure PBL (GCs only
+            // happen inside VMFrames, which re-set it) but FATAL once JS->wasm JIT
+            // helpers GC OUTSIDE any VMFrame -- the stale exitFP then points at
+            // reused stack holding boxed values and TraceJitFrames walks garbage
+            // (the GCZeal deep-chain crash, task #60).
+            uint8_t* trampolinePrevExitFP =
+                cx.getCx()->activation()->asJit()->jsExitFP();
             PUSHNATIVE(StackValNative(nullptr));  // fake return address.
             PUSHNATIVE(StackValNative(ctx.stack.fp));
             ctx.stack.fp = sp;
@@ -2438,6 +2473,7 @@ uint64_t ICInterpretOps(uint64_t arg0, uint64_t arg1, ICStub* stub,
                                                 : ExitFrameType::CallNative)));
             cx.getCx()->activation()->asJit()->setJSExitFP(
                 reinterpret_cast<uint8_t*>(ctx.stack.fp));
+            WJExitFPDbg(2, ctx.stack.fp);
             cx.getCx()->portableBaselineStack().top =
                 reinterpret_cast<void*>(sp);
 
@@ -2447,6 +2483,7 @@ uint64_t ICInterpretOps(uint64_t arg0, uint64_t arg1, ICStub* stub,
             bool success = native(cx, argc, args);
 
             ctx.stack.fp = trampolinePrevFP;
+            cx.getCx()->activation()->asJit()->setJSExitFP(trampolinePrevExitFP);
             POPNNATIVE(4);
 
             if (!success) {
@@ -2496,6 +2533,7 @@ uint64_t ICInterpretOps(uint64_t arg0, uint64_t arg1, ICStub* stub,
               PUSHNATIVE(StackValNative(uint32_t(ExitFrameType::CallNative)));
               cx.getCx()->activation()->asJit()->setJSExitFP(
                   reinterpret_cast<uint8_t*>(ctx.stack.fp));
+              WJExitFPDbg(3, ctx.stack.fp);
               cx.getCx()->portableBaselineStack().top =
                   reinterpret_cast<void*>(sp);
               js::wasm::gWJCallCallee = ObjectValue(*callee).asRawBits();
@@ -5922,16 +5960,34 @@ static EnvironmentObject& getEnvironmentFromCoordinate(
 #  define DEBUG_CHECK()
 #endif
 
+// GECKO_WJ_RESUMETRACE: per-op trace of the first JIT-deopt-resumed frame.
+// Compile-time gated (-DWJ_RTRACE, see DEBUGGING.md): the check would cost a
+// load+branch on EVERY interpreted op, and PBL is the tier-0 hot path.
+#ifdef WJ_RTRACE
+#  define WJ_RESUME_TRACE()                                                   \
+    if (MOZ_UNLIKELY(gPBLWJResumeTraceN > 0)) {                               \
+      gPBLWJResumeTraceN--;                                                   \
+      uint64_t topBits = sp[0].asUInt64();                                    \
+      fprintf(stderr, "[wj-rtrace] pc=%u %s sp0=%016llx\n",                   \
+              unsigned(pc - frame->script()->code()), js::CodeName(JSOp(*pc)),\
+              (unsigned long long)topBits);                                   \
+    }
+#else
+#  define WJ_RESUME_TRACE()
+#endif
+
 #define LABEL(op) (&&label_##op)
 #ifdef ENABLE_COMPUTED_GOTO_DISPATCH
 #  define CASE(op) label_##op:
-#  define DISPATCH() \
-    DEBUG_CHECK();   \
+#  define DISPATCH()  \
+    DEBUG_CHECK();    \
+    WJ_RESUME_TRACE() \
     goto* addresses[*pc]
 #else
 #  define CASE(op) label_##op : case JSOp::op:
-#  define DISPATCH() \
-    DEBUG_CHECK();   \
+#  define DISPATCH()  \
+    DEBUG_CHECK();    \
+    WJ_RESUME_TRACE() \
     goto dispatch
 #endif
 
@@ -6013,9 +6069,8 @@ static EnvironmentObject& getEnvironmentFromCoordinate(
 #endif
 
 // Gate for the arith-IC double-enrichment fix (above). Default ON; set
-// GECKO_WJ_NOARITHENRICH=1 to revert to the old warm-bypasses-fallback behavior.
 static MOZ_ALWAYS_INLINE bool WJArithEnrich() {
-  static int v = getenv("GECKO_WJ_NOARITHENRICH") ? 0 : 1;
+  constexpr int v = 1;  // arith-IC double-enrichment is permanent
   return v;
 }
 // Inline-double fast-path may bypass the IC fallback only once the double stub is
@@ -6111,8 +6166,12 @@ PBIResult PortableBaselineInterpret(
     // Save the entry frame so that when unwinding, we know when to
     // return from this C++ frame.
     entryFrame = sp;
-    // Save the entry PC so that we can compute offsets locally.
-    entryPC = pc;
+    // Base for bytecode-offset computations (TableSwitch resumeOffsets are
+    // script-absolute). Must be the script's code start, NOT the entry pc: the
+    // JS->wasm JIT deopt-resume path enters at a non-zero pc, and entryPC = pc
+    // made every TableSwitch in the resumed frame jump pcOff bytes past its
+    // real target (the reloop-switch corruption family).
+    entryPC = frame->script()->code();
   }
 
   bool from_unwind = false;
@@ -7995,32 +8054,24 @@ PBIResult PortableBaselineInterpret(
             // Scheduler.schedule) is only CALLED a few times -- it loops internally --
             // so a high call-count gate never observes it, leaving the hottest function
             // in the interpreter while its frequently-called callees get compiled.
-            if (!constructing && calleeScript->getWarmUpCount() >= 10 &&
-                js::wasm::WasmJitObserveCall(calleeScript.get())) {
-              TRACE_PRINTF("missed fastpath: routed to wasm-jit via IC\n");
-              break;
-            }
-            // Experimental (GECKO_WJ_COLDCALL): during the caller's warm-up
-            // window, route calls through the IC so each call-site IC accumulates
-            // entered-count for trial inlining. Gated off by default (it slows
-            // warmup and inlining doesn't yet fire).
-            {
-              static int sWJCallIC = -1;
-              if (sWJCallIC < 0) sWJCallIC = getenv("GECKO_WJ_COLDCALL") ? 1 : 0;
-              if (sWJCallIC && !constructing &&
-                  frame->script()->getWarmUpCount() < 4096) {
-                break;
+            if (!constructing && calleeScript->getWarmUpCount() >= 10) {
+              int wjpc = js::wasm::WasmJitPreCall(calleeScript.get());
+              bool wjRouted = false;
+              if (wjpc == 1) {
+                wjRouted = js::wasm::WasmJitObserveCall(calleeScript.get());
+              } else if (wjpc == 2) {
+                // A synchronous compile may run (allocates -> can GC): establish
+                // a covering exit frame first so a GC traces the live PBL frames
+                // (task #60 -- with no frame, exitFP is null and they'd be missed).
+                frame->interpreterPC() = pc;
+                SYNCSP();
+                VMFrame wjvm(ctx.frameMgr, ctx.stack, sp);
+                if (wjvm.success()) {
+                  wjRouted = js::wasm::WasmJitObserveCall(calleeScript.get());
+                }
               }
-              // Also route CONSTRUCT calls through the IC once the caller is
-              // warm, so the New-op IC accumulates a CallScriptedFunction
-              // construct stub. Without a construct stub, TrialInliner can't see
-              // the constructor (nOpt=0) and every `new X` stays an un-inlined
-              // CreateThis -> the per-object allocation can never be scalar-
-              // replaced. Gated on COLDCALL so the default path is unchanged.
-              static int sWJCtorIC = -1;
-              if (sWJCtorIC < 0) sWJCtorIC = getenv("GECKO_WJ_CTORIC") ? 1 : 0;
-              if (sWJCtorIC && constructing &&
-                  frame->script()->getWarmUpCount() < 4096) {
+              if (wjRouted) {
+                TRACE_PRINTF("missed fastpath: routed to wasm-jit via IC\n");
                 break;
               }
             }
@@ -8491,22 +8542,6 @@ PBIResult PortableBaselineInterpret(
         // heavily) accumulates warm-up and gets observed for compilation -- otherwise a
         // call-count-only gate leaves the hottest function stuck in the interpreter.
         frame->script()->incWarmUpCounter();
-        // Experimental (GECKO_WJ_COLDCALL): drive trial inlining like production's
-        // baseline warmup hook so WarpBuilder could inline dispatch. Off by
-        // default -- it does not yet inline under PBL (timing/IC-population), so
-        // it only adds warmup cost; kept gated for future work.
-        {
-          static int sWJTI = -1;
-          if (sWJTI < 0) sWJTI = getenv("GECKO_WJ_COLDCALL") ? 1 : 0;
-          uint32_t wc = frame->script()->getWarmUpCount();
-          if (sWJTI && wc && (wc % 256) == 0 && wc <= 256 * 12 &&
-              frame->script()->hasJitScript()) {
-            PUSH_EXIT_FRAME();
-            if (!jit::DoTrialInlining(cx, frame)) {
-              GOTO_ERROR();
-            }
-          }
-        }
 #endif
         COUNT_COVERAGE_PC(pc);
         END_OP(LoopHead);
@@ -9649,8 +9684,7 @@ bool WasmJitResumeViaPBL(JSContext* cx, JSScript* script, uint64_t thisBits,
   // silent wrong-upvar bug: an entry (pc==0) deopt of a CallObject-owning fn kept
   // the enclosing env as the frame env and skipped the prologue's CallObject
   // creation, so GetAliasedVar upvar reads were one scope too high.
-  // GECKO_WJ_NOENTRYENVFIX reverts.
-  static int entryEnvFix = getenv("GECKO_WJ_NOENTRYENVFIX") ? 0 : 1;
+  constexpr int entryEnvFix = 1;  // entry-resume env fix is permanent
   {
     static int envDbg = getenv("GECKO_WJ_ENTRYENVDBG") ? 1 : 0;
     static int dbgLine = getenv("GECKO_WJ_ENTRYENVDBG") ? atoi(getenv("GECKO_WJ_ENTRYENVDBG")) : 0;
@@ -9728,6 +9762,18 @@ bool WasmJitResumeViaPBL(JSContext* cx, JSScript* script, uint64_t thisBits,
   jsbytecode* pc = script->code() + pcOff;
   ImmutableScriptData* isd = script->immutableScriptData();
   Value result;
+  {
+    static int rtraceN = getenv("GECKO_WJ_RESUMETRACE")
+                             ? atoi(getenv("GECKO_WJ_RESUMETRACE")) : 0;
+    static int rtraceArmed = 0;
+    if (rtraceN && !rtraceArmed) {
+      rtraceArmed = 1;
+      gPBLWJResumeTraceN = rtraceN;
+      fprintf(stderr, "[wj-rtrace] === resume %s:%u pcOff=%u ===\n",
+              script->filename() ? script->filename() : "?",
+              unsigned(script->lineno()), pcOff);
+    }
+  }
   gPBLResumeEnclosingEnv = enclosingEnv;
   gPBLResumeKeepEnv = keepFrameEnv;
   gPBLResumeInError = resumeInError;

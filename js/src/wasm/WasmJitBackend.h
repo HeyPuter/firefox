@@ -314,11 +314,23 @@ extern uint32_t gWJResumeNArgs[];       // per frame
 extern uint32_t gWJResumeNLocals[];     // per frame
 extern uint32_t gWJResumeValsOff[];     // start index into gWJResumeVals, per frame
 extern uint32_t gWJResumeCalleeFn[];    // runtime callee fn* per frame (0 = canonical)
+// Beyond-formal actuals for the deopt-resume: an arguments-using fn called with
+// MORE actuals than formals must hand PBL the full actuals -- the resume point
+// only carries formals, so resuming with argc=nargs made `arguments` empty/short
+// (lodash overRest closure saw arguments.length==0). The deopt spill stores the
+// staged actuals + the entry argc snapshot; WJH_RESUME grafts slots [nargs,argc)
+// into the physical (outermost) frame's arg region. 0 = no graft. Traced while
+// gWJResumeActive (boxed Values).
+extern uint64_t gWJResumeActuals[];
+extern uint32_t gWJResumeActualArgc;
+extern uint32_t gWJExitFPLastSite;   // task #60 exitFP setter tracer
+extern uint32_t gWJExitFPSetCount;
 extern uint32_t gWJLastDeoptOp;         // MIR opcode of the most recent deopt site
 extern const uint32_t gWJOpGuardGlobalGeneration;  // numeric MIR opcode (backend-exported)
 // Call boundary: callee + argc for wjhelp(WJH_CALL).
 extern uint64_t gWJCallCallee;
 extern uint32_t gWJCallSiteLine[];  // DEBUG: caller script line per call site
+const char* WJMirOpName(uint32_t op);  // MIR opcode -> name (for histograms in other TUs)
 extern uint32_t gWJCallArgc;
 // Constructing call: newTarget (boxed) for wjhelp(WJH_CREATETHIS isn't this --
 // this is for the construct CALL itself). `this` is staged at gWJScratch[kWJThisSlot].

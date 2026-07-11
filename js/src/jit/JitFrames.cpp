@@ -1416,7 +1416,41 @@ static void TraceTrampolineNativeFrame(JSTracer* trc,
   }
 }
 
+extern "C" uint32_t WJExitFPDbgState(uint32_t* cnt);  // task #60 setter tracer
+// Task #60 walk-ring globals (see TraceJitFrames): survive a wasm trap so the
+// post-mortem dump can name the frame being traced when the OOB hit.
+struct WjWalkEnt { int ty; void* fp; void* ret; };
+static WjWalkEnt gWjWalk[8] = {};
+static int gWjWalkN = 0;
+static void* gWjWalkAct = nullptr;
+extern "C" void WJDumpWalkRing() {
+  fprintf(stderr, "[wj-walkring] activation=%p walked=%d\n", gWjWalkAct,
+          gWjWalkN);
+  for (int wi = 0; wi < 8 && wi < gWjWalkN; wi++) {
+    const WjWalkEnt& en = gWjWalk[(gWjWalkN - 1 - wi) & 7];
+    fprintf(stderr, "[wj-walkring]   walk[-%d] type=%d fp=%p ret=%p\n", wi,
+            en.ty, en.fp, en.ret);
+  }
+  if (gWjWalkN >= 1) {
+    uintptr_t base = uintptr_t(gWjWalk[(gWjWalkN - 1) & 7].fp);
+    fprintf(stderr, "[wj-walkring]   lastFp=%p words[-2..+8]:", (void*)base);
+    for (int k = -2; k <= 8; k++) {
+      fprintf(stderr, " %08x",
+              unsigned(*reinterpret_cast<uint32_t*>(base + k * 4)));
+    }
+    uint32_t wjSetCnt = 0;
+    uint32_t wjSetSite = WJExitFPDbgState(&wjSetCnt);
+    fprintf(stderr, "\n[wj-walkring]   lastSetterSite=%u setCount=%u\n",
+            wjSetSite, wjSetCnt);
+  }
+}
 void TraceJitFrames(JSTracer* trc, JitActivation* activation) {
+  // A null exitFP = no covering exit frame right now (e.g. between PBL VMFrames
+  // -- their dtors restore the previous exitFP, which is null at the outermost).
+  // Nothing to walk; parsing a frame at null OOB-crashed under GCZeal (task #60).
+  if (!activation->hasExitFP()) {
+    return;
+  }
 #ifdef CHECK_OSIPOINT_REGISTERS
   if (JitOptions.checkOsiPointRegisters) {
     // GC can modify spilled registers, breaking our register checks.
@@ -1430,9 +1464,17 @@ void TraceJitFrames(JSTracer* trc, JitActivation* activation) {
   // maps as we unwind.  It has no functional purpose.
   uintptr_t highestByteVisitedInPrevWasmFrame = 0;
 
+  // JS->wasm JIT diagnosis (task #60): ring of the walked frames -- GLOBAL so a
+  // wasm TRAP mid-trace (OOB while tracing a stale frame) can still be dumped
+  // post-mortem via WJDumpWalkRing (called by WJDumpCrashState).
+  gWjWalkN = 0;
+  gWjWalkAct = (void*)activation;
   for (JitFrameIter frames(activation); !frames.done(); ++frames) {
     if (frames.isJSJit()) {
       const JSJitFrameIter& jitFrame = frames.asJSJit();
+      gWjWalk[gWjWalkN & 7] = {int(jitFrame.type()), (void*)jitFrame.fp(),
+                               (void*)jitFrame.resumePCinCurrentFrame()};
+      gWjWalkN++;
       switch (jitFrame.type()) {
         case FrameType::Exit:
           TraceJitExitFrame(trc, jitFrame);
@@ -1464,6 +1506,16 @@ void TraceJitFrames(JSTracer* trc, JitActivation* activation) {
           // in the next iteration.
           break;
         default:
+          // JS->wasm JIT diagnosis (task #60): name the garbage descriptor before
+          // dying -- the zeal-mode deep-chain crash walks into a frame the
+          // JS_CODEGEN_NONE iterator can't parse.
+          fprintf(stderr,
+                  "[wj-tracejit] unexpected frame type=%d fp=%p retAddr=%p "
+                  "activation=%p walked=%d\n",
+                  int(jitFrame.type()), (void*)jitFrame.fp(),
+                  (void*)jitFrame.resumePCinCurrentFrame(), (void*)activation,
+                  gWjWalkN);
+          WJDumpWalkRing();
           MOZ_CRASH("unexpected frame type");
       }
       highestByteVisitedInPrevWasmFrame = 0; /* "unknown" */

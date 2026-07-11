@@ -35,6 +35,8 @@ namespace JS {
 class JS_PUBLIC_API Realm;
 }  // namespace JS
 
+extern "C" void WJExitFPDbgRecord(int siteId, void* v);  // task #60 tracer
+
 namespace js {
 class ArgumentsObject;
 }  // namespace js
@@ -206,6 +208,7 @@ void JitFrameIter::settle() {
 
     if (mustUnwindActivation_) {
       act_->setJSExitFP(prevFP);
+      WJExitFPDbgRecord(4, prevFP);
     }
 
     iter_.destroy();
@@ -234,6 +237,7 @@ void JitFrameIter::operator++() {
       // ScriptFrameIter does not crash when accessing an IonScript
       // that's destroyed by the ionScript->decref call.
       EnsureUnwoundJitExitFrame(act_, prevFrame);
+      WJExitFPDbgRecord(5, prevFrame);
     }
   } else if (isWasm()) {
     ++asWasm();

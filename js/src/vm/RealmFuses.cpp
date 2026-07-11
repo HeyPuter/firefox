@@ -17,6 +17,7 @@
 #include "vm/ObjectOperations.h"
 #include "vm/Realm.h"
 #include "vm/SelfHosting.h"
+#include "wasm/WasmJit.h"
 
 #include "vm/JSObject-inl.h"
 
@@ -29,6 +30,10 @@ void js::InvalidatingRealmFuse::popFuse(JSContext* cx, RealmFuses& realmFuses) {
   }
 
   InvalidatingFuse::popFuse(cx);
+
+  // The wasm-JIT registers no per-script fuse dependencies; flush all its
+  // installed code so recompiles read the popped fuse (see WasmJit.h).
+  js::wasm::WasmJitInvalidateAll(name());
 
   for (auto& fd : realmFuses.fuseDependencies) {
     fd.invalidateForFuse(cx, this);

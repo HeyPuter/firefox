@@ -305,9 +305,25 @@ static int AssembleAndInstall(MIRGenerator& mirGen, MIRGraph& graph,
 
 // Build Warp MIR for `script`, optimize, lower to wasm, host-compile. Returns a
 // host handle (>=0) on success and writes *nargsOut, or -1 to stay in PBL.
+// Monotonic count of INSTALLED compiles (for GECKO_WJ_COMPILEMAX bisection).
+static uint32_t gWJCompileSerial = 0;
+
 int WJWarpCompile(JSContext* cx, JSScript* script, uint32_t* nargsOut,
                   uint32_t* nlocalsOut, int* tblSlotOut) {
   bool dump = getenv("GECKO_WJWARP_DUMP");
+  // Compile-count bisection (tasks #57/#64): GECKO_WJ_COMPILEMAX=N lets only
+  // the first N functions install (later ones bail to PBL = correct-by-
+  // definition). With GECKO_WJ_INSTLOG=1 printing each install's serial,
+  // binary-search N to find WHICH compiled fn breaks a workload, then MIRDUMP
+  // that fn. (A fn that fails only when OTHER fns are compiled points at a
+  // caller/callee interaction instead.)
+  static int compileMax = getenv("GECKO_WJ_COMPILEMAX")
+                              ? atoi(getenv("GECKO_WJ_COMPILEMAX"))
+                              : -1;
+  if (compileMax >= 0 && gWJCompileSerial >= uint32_t(compileMax)) {
+    js::wasm::gWJBailReason = "compilemax";
+    return -1;
+  }
   // Functions with try/catch/finally (try-notes): our JIT propagates a thrown
   // exception OUT of a function via a return flag, but has NO in-function CATCH
   // landing pad. So a throw inside a try region unwinds PAST its own catch instead
@@ -496,9 +512,11 @@ int WJWarpCompile(JSContext* cx, JSScript* script, uint32_t* nargsOut,
   }
   *nargsOut = nargs;
   *nlocalsOut = info->nlocals();
+  gWJCompileSerial++;
   static int instlog = getenv("GECKO_WJ_INSTLOG") ? 1 : 0;
   if (dump || instlog)
-    fprintf(stderr, "[wb-compile] installed %s:%u handle=%d nargs=%u\n",
+    fprintf(stderr, "[wb-compile] installed #%u %s:%u handle=%d nargs=%u\n",
+            gWJCompileSerial,
             script->filename() ? script->filename() : "?",
             uint32_t(script->lineno()), handle, nargs);
   return handle;

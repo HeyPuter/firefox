@@ -33,6 +33,7 @@ namespace wasm {
 // Returns true once `script` is compiled and installed (the caller then routes
 // the call through WasmJitRunCall); false to keep running in the interpreter.
 extern bool WasmJitObserveCall(JSScript* script);
+extern int WasmJitPreCall(JSScript* script);  // 0=no-jit 1=compiled 2=may-compile
 
 // Compile any functions that crossed the warmup threshold while GECKO_WJ_DEFERCOMPILE
 // deferred their (synchronous) compile off the critical path. Call at an idle / task
@@ -50,6 +51,14 @@ extern int WasmJitRunCall(JSScript* script, uint64_t thisBits,
 // the shell's inWasmJit()/inJit()/inIon() so the jit-test warm-up spin loops
 // (`do { f(); } while (!inIon())`) can detect that `f` got JIT-compiled.
 extern bool WasmJitInWasm();
+
+// Discard ALL installed wasm-JIT code (entries reset to cold, call ICs
+// cleared). Called when an invalidating fuse pops: compiled code may have
+// baked a fuse-guarded elision (e.g. the array-destructuring iterator
+// protocol), and unlike Ion we register no per-script fuse dependencies --
+// a full flush on this rare event is the sound equivalent. Re-warmed
+// recompiles read the popped fuse and drop the elision.
+extern void WasmJitInvalidateAll(const char* reason);
 
 }  // namespace wasm
 }  // namespace js

@@ -33,6 +33,14 @@ JSJitFrameIter::JSJitFrameIter(const JitActivation* activation)
     current_ = activation_->bailoutData()->fp();
     type_ = FrameType::Bailout;
   }
+  // A null exitFP = no covering exit frame right now (PBL VMFrame dtors restore
+  // the previous exitFP, null at the outermost). Mark the iterator done instead
+  // of parsing a frame at null -- garbage there types as IonJS(0) and crashed
+  // checkInvalidation under GCZeal (task #60). Covers ALL iterator users
+  // (TraceJitFrames, UpdateJitActivationsForMinorGC, FrameIter, ...).
+  if (!current_) {
+    type_ = FrameType::CppToJSJit;
+  }
   MOZ_ASSERT(!TlsContext.get()->inUnsafeCallWithABI);
 }
 
