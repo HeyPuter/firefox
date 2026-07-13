@@ -35,6 +35,7 @@
 #include "builtin/Object.h"      // js::ObjectClassToString (WJH_OBJCLASSTOSTRING)
 #include "builtin/MapObject.h"   // js::MapObject::create / js::SetObject::create (WJH_NEWMAP/NEWSET)
 #include "jit/JitScript.h"
+#include "jit/JitScript-inl.h"  // inline AutoKeepJitScripts ctor/dtor (WJH_RESUME JitScript recreate)
 #include "jit/VMFunctions.h"  // CreateThisFromIon
 #include "js/experimental/JitInfo.h"  // JSJitGetterOp, JSJitGetterCallArgs (WJH_GETDOMPROP)
 #include "vm/JSScript.h"
@@ -2321,6 +2322,21 @@ static double wjhelpImpl(double kindF, double siteF) {
     for (uint32_t f = 0; f < nframes; f++) {
       RootedScript script(
           cx, reinterpret_cast<JSScript*>(uintptr_t(gWJResumeScriptPtr[f])));
+      if (script && !script->hasJitScript()) {
+        // A GC (esp. gczeal) can DISCARD this script's JitScript between the deopt
+        // spill and this resume. PBL needs the JitScript (it interprets the Baseline
+        // ICs) to run the rest of the frame, so a missing one used to fail the resume
+        // with a silent "threw"/NO-pending-exception (the deterministic gczeal-7,1
+        // int/pow deopt crash: WJH_RESUME kind=1 -> [wj-resume-noexc] hasJit=0).
+        // Recreate it (valid script; JitScript is derivable from bytecode, fresh cold
+        // ICs are correct - PBL just re-warms them) instead of aborting. Mirrors the
+        // WasmJitWarp compile-entry ensureHasJitScript path.
+        if (cx->zone()->ensureJitZoneExists(cx)) {
+          AutoRealm ar(cx, script);
+          js::jit::AutoKeepJitScripts keep(cx);
+          (void)script->ensureHasJitScript(cx, keep);
+        }
+      }
       if (!script || !script->hasJitScript()) {
         if (getenv("GECKO_WJ_DEPTHDBG"))
           fprintf(stderr, "[wj-resume-noexc] f=%u script=%p hasJit=%d\n", f,
@@ -2876,6 +2892,26 @@ static double wjhelpImpl(double kindF, double siteF) {
     // poison pattern (0x2B*) -- i.e. an inline access read a FREED (collected) cell's
     // memory: the reuse-staleness GC bug, caught at the exact read. gWJHelpObj holds
     // the read's PC-ish site; the value bits are reported by the caller's site arg.
+    //
+    // GECKO_WJ_CHECKCELL_LOG=1 makes this AGGREGATE instead of crash-on-first: it
+    // histograms stale-read sites (per-site count) and returns, so a full run (or the
+    // non-deterministic #19 under-rooting) yields a RANKED list of stale-read sites
+    // instead of dying at the first. Dump via __wjStats()'s staleReads / on quit. The
+    // default (flag unset) preserves the crash-on-first behavior for pinpoint use.
+    static int aggLog = getenv("GECKO_WJ_CHECKCELL_LOG") ? 1 : 0;
+    if (aggLog) {
+      static const uint32_t kSlots = 4096;
+      static uint64_t hits[kSlots] = {0};
+      static uint64_t total = 0;
+      uint32_t slot = uint32_t(int(siteF)) & (kSlots - 1);
+      uint64_t c = ++hits[slot];
+      if (c == 1 || (++total % 500) == 1) {
+        fprintf(stderr, "[wj-checkcell-log] STALE read site=%d count=%llu total=%llu\n",
+                int(siteF), (unsigned long long)c, (unsigned long long)total);
+        fflush(stderr);
+      }
+      return 0.0;  // aggregate: do NOT crash (caller continues; may crash downstream)
+    }
     fprintf(stderr, "[wj-poison] STALE READ of freed cell -- site=%d objloc=%u (GC reuse-staleness)\n",
             int(siteF), gWJHelpObj);
     fflush(stderr);

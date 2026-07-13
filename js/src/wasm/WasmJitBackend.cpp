@@ -2032,8 +2032,19 @@ static void WJCollectRoots(WJBackend& be, MInstruction* ins,
   // (fuller but ~15% compute cost).
   static int rootLive = WJGETENV("GECKO_WJ_NOROOTLIVE") ? 0 : 1;
   static int rootLiveVal = WJGETENV("GECKO_WJ_ROOTLIVEVAL") ? 1 : 0;
+  // A liveAfterSet def in ins's OWN block is either scheduled BEFORE ins (then it dominates
+  // ins and was already rooted by the dominating-block consider() loop) or AFTER ins
+  // (loop-carried: its local at ins holds a PREVIOUS iteration's value, possibly already
+  // dead -> ROOTLIVE spilling it roots a STALE ptr -> GC "memory access out of bounds").
+  // Either way ROOTLIVE must NOT root a same-block def: a value defined after ins has no
+  // valid slot AT this safepoint, so it can never be a root needed here. SOUND (only removes
+  // provably-invalid roots; can't drop a needed one). Fixes the regex-literal-under-GC OOB
+  // (stab/tokreal.js) without touching postcss #19 (a DIFFERENT-block non-dominating value).
+  // GECKO_WJ_ROOTLIVEKEEPSAMEBLK reverts. See stability-fuzzer-and-gcstress memory.
+  static int rlSameBlkSkip = WJGETENV("GECKO_WJ_ROOTLIVEKEEPSAMEBLK") ? 0 : 1;
   if (!rootAll && rootLive) {
     for (const MDefinition* d : liveAfterSet) {
+      if (rlSameBlkSkip && d->block() == insBlock) continue;
       bool isObj = d->type() == MIRType::Object;
       bool isVal = d->type() == MIRType::Value;
       if (((isObj || (isVal && rootLiveVal))) && be.local(d) >= 0)
@@ -6384,24 +6395,17 @@ static bool EmitValue(Encoder& e, WJBackend& be, MInstruction* ins) {
     case MDefinition::Opcode::Mod: {
       if (ins->type() == MIRType::Double) {
         // JS `a % b` on doubles == C fmod (result has sign of `a`, |result|<|b|).
-        // wasm has no f64.rem, but fmod(a,b) == a - b*trunc(a/b) exactly (handles
-        // inf/0/NaN edge cases identically: trunc(NaN)=NaN propagates). Compute
-        // a/b once into a temp would need a local; recompute is fine (GetOp is
-        // cheap for locals/consts).
-        MDefinition* a = ins->getOperand(0);
-        MDefinition* b = ins->getOperand(1);
-        if (!GetOp(e, be, a)) return false;                 // a
-        if (!GetOp(e, be, b)) return false;                 // a b
-        if (!GetOp(e, be, a) || !GetOp(e, be, b)) return false;  // a b a b
-        if (!e.writeOp(Op::F64Div)) return false;           // a b (a/b)
-        if (!e.writeOp(Op::F64Trunc)) return false;         // a b trunc(a/b)
-        if (!e.writeOp(Op::F64Mul)) return false;           // a (b*trunc)
-        if (!e.writeOp(Op::F64Sub)) return false;           // a - b*trunc
-        // fmod's result carries the DIVIDEND's sign -- including ±0 (fmod(-1,1)
-        // = -0), which the subtraction formula loses (x - x = +0). copysign is
-        // an identity for every correct nonzero result and fixes the zero case
-        // (jit-test cacheir/binaryarith-mod-int32 via the Double-typed Mod).
-        return GetOp(e, be, a) && e.writeOp(Op::F64CopySign);
+        // wasm has no f64.rem. The identity a - b*trunc(a/b) is NOT exact in
+        // floating point and was a miscompile: an infinite divisor gives
+        // inf*0 = NaN (fmod(a,inf)==a), and a large quotient loses precision so
+        // b*trunc(a/b) rounds back to a, yielding 0 (e.g. 1 % 1e-10 == 0 instead
+        // of ~1e-10). Route through js::ModValues -- the canonical fmod-correct
+        // VM op Pow also uses. Operands boxed into scratch[0]/[1].
+        if (!EmitStageScratch(e, be, ins->getOperand(0), 0)) return false;
+        if (!EmitStageScratch(e, be, ins->getOperand(1), 1)) return false;
+        if (!EmitHelperCallResult(e, be, ins, WJH_BINARYARITH, uint32_t(JSOp::Mod)))
+          return false;
+        return EmitHelperResultAsType(e, be, ins->type());  // Double
       }
       if (ins->type() == MIRType::Int32) {
         MMod* m = ins->toMod();

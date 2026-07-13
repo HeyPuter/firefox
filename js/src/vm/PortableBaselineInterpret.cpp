@@ -3965,8 +3965,13 @@ uint64_t ICInterpretOps(uint64_t arg0, uint64_t arg1, ICStub* stub,
           FAIL_IC();
         }
         double result = std::floor(input);
-        int32_t intResult = int32_t(result);
-        if (double(intResult) != result) {
+        // NB: use NumberEqualsInt32, NOT `int32_t(result)` + `double(...) != result`:
+        // (int32_t)double is UB for out-of-int32-range doubles, and the compiler
+        // optimizes the round-trip check to `result != result` (false) assuming the
+        // cast is in-range -> the guard never fires and the wasm-saturated value
+        // (INT32_MAX for e.g. floor(9e11)) is wrongly returned instead of bailing.
+        int32_t intResult;
+        if (!mozilla::NumberEqualsInt32(result, &intResult)) {
           FAIL_IC();
         }
         retValue = Int32Value(intResult).asRawBits();
@@ -3981,8 +3986,8 @@ uint64_t ICInterpretOps(uint64_t arg0, uint64_t arg1, ICStub* stub,
           FAIL_IC();
         }
         double result = std::ceil(input);
-        int32_t intResult = int32_t(result);
-        if (double(intResult) != result) {
+        int32_t intResult;  // see MathFloorToInt32Result: avoid UB (int32_t)double cast
+        if (!mozilla::NumberEqualsInt32(result, &intResult)) {
           FAIL_IC();
         }
         retValue = Int32Value(intResult).asRawBits();
@@ -3993,12 +3998,15 @@ uint64_t ICInterpretOps(uint64_t arg0, uint64_t arg1, ICStub* stub,
       CACHEOP_CASE(MathTruncToInt32Result) {
         NumberOperandId inputId = cacheIRReader.numberOperandId();
         double input = READ_VALUE_REG(inputId.id()).toNumber();
-        if (input == 0.0 && std::signbit(input)) {
+        // trunc(x) yields -0 for x in ]-1, -0] (like ceil), which is not
+        // representable as int32 -- bail so the site falls back to the
+        // double-returning stub. Narrower `input == 0.0` misses trunc(-0.1)=-0.
+        if (input > -1.0 && std::signbit(input)) {
           FAIL_IC();
         }
         double result = std::trunc(input);
-        int32_t intResult = int32_t(result);
-        if (double(intResult) != result) {
+        int32_t intResult;  // see MathFloorToInt32Result: avoid UB (int32_t)double cast
+        if (!mozilla::NumberEqualsInt32(result, &intResult)) {
           FAIL_IC();
         }
         retValue = Int32Value(intResult).asRawBits();
@@ -4012,8 +4020,8 @@ uint64_t ICInterpretOps(uint64_t arg0, uint64_t arg1, ICStub* stub,
         if (input == 0.0 && std::signbit(input)) {
           FAIL_IC();
         }
-        int32_t intResult = int32_t(input);
-        if (double(intResult) != input) {
+        int32_t intResult;  // see MathFloorToInt32Result: avoid UB (int32_t)double cast
+        if (!mozilla::NumberEqualsInt32(input, &intResult)) {
           FAIL_IC();
         }
         retValue = Int32Value(intResult).asRawBits();
