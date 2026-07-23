@@ -10,6 +10,7 @@
 // drives the MIR->wasm back-end (WasmJitBackend.cpp), assembles a wasm module,
 // and host-compiles + instantiates it. Returns a host handle (or -1).
 
+#include "mozilla/Maybe.h"      // gated AutoSuppressGC over the compile (GECKO_WJ_NOCOMPILESUPPRESSGC)
 #include "mozilla/ScopeExit.h"
 #include "mozilla/TimeStamp.h"  // GECKO_WJ_COMPILESTAT split compile timing
 
@@ -310,6 +311,26 @@ static uint32_t gWJCompileSerial = 0;
 
 int WJWarpCompile(JSContext* cx, JSScript* script, uint32_t* nargsOut,
                   uint32_t* nlocalsOut, int* tblSlotOut) {
+  // On-thread synchronous tier-up compilation holds RAW GC pointers to its inputs --
+  // the CompileInfo JSScript* (rp->block()->info().script()), WarpSnapshot-baked
+  // shapes/objects as MIR constants, and baked pc/gcthing pointers -- while allocating
+  // (snapshot/MIR LifoAlloc, encoder buffers, inline template reads). A COMPACTING GC
+  // firing mid-compile (GECKO_GCZEAL=14, or a real shrinking GC under memory pressure)
+  // MOVES those tenured cells, leaving the compiler's raw pointers stale -> EmitValue's
+  // `sc->getShape(pc)` derefs a moved JSScript -> OOB "unreachable" (bench/difftests/
+  // gcleads/forof-compaction.js: for-of/spread over an array traps under 14,2 while PBL
+  // is correct; the trigger is the object-literal NewObject in the hot iterator/loop fn,
+  // NOT a runtime rooting bug). Real Ion compiles OFF-THREAD against a rooted/traced
+  // WarpSnapshot, so a moving GC never invalidates its inputs; this on-thread path must
+  // suppress moving GC for the compile's duration. NARROW: covers ONLY compilation --
+  // runtime execution still sees full gczeal, so runtime rooting hazards stay observable.
+  // Non-moving GC (gczeal 2, mark-only) and minor GC (7) never tripped this (they don't
+  // move tenured), consistent with a compaction-relocation root cause.
+  // GECKO_WJ_NOCOMPILESUPPRESSGC=1 reverts (crash returns -> confirms this is the fix).
+  static int noCompileSuppressGC =
+      getenv("GECKO_WJ_NOCOMPILESUPPRESSGC") ? 1 : 0;
+  mozilla::Maybe<js::gc::AutoSuppressGC> compileSuppressGC;
+  if (!noCompileSuppressGC) compileSuppressGC.emplace(cx);
   bool dump = getenv("GECKO_WJWARP_DUMP");
   // Compile-count bisection (tasks #57/#64): GECKO_WJ_COMPILEMAX=N lets only
   // the first N functions install (later ones bail to PBL = correct-by-

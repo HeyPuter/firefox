@@ -9672,7 +9672,31 @@ bool WasmJitResumeViaPBL(JSContext* cx, JSScript* script, uint64_t thisBits,
     // propagating until the outer PBI activation picks the unwind up.
     return false;
   }
-  JSFunction* fun = runtimeCallee ? runtimeCallee : script->function();
+  // The runtime callee (the closure instance spilled at deopt) is only a VALID
+  // callee for this resume frame if its script IS the resume script. A mismatch
+  // means the env-root slot held a callee for a DIFFERENT script (observed in
+  // tweetnacl closures under GC churn: runtimeCallee->baseScript() != script).
+  // Using it makes the frame's calleeToken point at the wrong script, so
+  // frame->script() != the script the resume pc/locals belong to, and
+  // resumePcOff = pc - frame->script()->code() is garbage -> the OSR icEntry
+  // realign (interpreterICEntryFromPCOffset) indexes out of bounds and crashes.
+  // Fall back to the canonical function of the CORRECT script when the runtime
+  // callee doesn't match (env is separately supplied via envChain/enclosingEnv
+  // for a mid-function resume). GECKO_WJ_NORESUMECALLEEMATCH reverts to the old
+  // unconditional-runtimeCallee behavior.
+  static int noCalleeMatch = getenv("GECKO_WJ_NORESUMECALLEEMATCH") ? 1 : 0;
+  JSFunction* fun;
+  if (noCalleeMatch) {
+    fun = runtimeCallee ? runtimeCallee : script->function();
+  } else {
+    fun = script->function();
+    if (runtimeCallee && runtimeCallee->isInterpreted() &&
+        runtimeCallee->hasBaseScript() &&
+        static_cast<void*>(runtimeCallee->baseScript()) ==
+            static_cast<void*>(script)) {
+      fun = runtimeCallee;
+    }
+  }
   if (!fun) return false;
   // ENTRY-resume env fix: a deopt at the function's first bytecode (pcOff==0)
   // resumes BEFORE the prologue builds the frame's own scope, so the initial

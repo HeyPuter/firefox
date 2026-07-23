@@ -83,6 +83,17 @@ bool Thread::Start() { return StartWithOptions(Options()); }
 bool Thread::StartWithOptions(const Options& options) {
   DCHECK(!message_loop_);
 
+#if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
+  // Single-threaded wasm: no OS threads. Bind this "thread" to the current
+  // (main) MessageLoop -- posted and delayed tasks run there -- and run the
+  // subclass Init() inline. Users of message_loop()/PostTask keep working;
+  // the thread's own Run() loop never executes (nothing blocks on it).
+  message_loop_ = MessageLoop::current();
+  thread_id_ = PlatformThread::CurrentId();
+  Init();
+  return true;
+#endif
+
   SetThreadWasQuitProperly(false);
 
   StartupData startup_data(options);

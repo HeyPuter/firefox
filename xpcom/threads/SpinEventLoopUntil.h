@@ -170,7 +170,20 @@ bool SpinEventLoopUntil(const nsACString& aVeryGoodReasonToDoThis,
     asa.emplace(false);
   }
 
+#if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
+  // Single-threaded wasm: a spin whose predicate needs the JS event loop can
+  // never finish (JS is blocked while we run) -- it busy-wedges the browser
+  // main thread. Self-report periodically so runaway spins are identifiable.
+  uint64_t stSpins = 0;
+#endif
   while (!aPredicate()) {
+#if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
+    if ((++stSpins & 0xFFFFF) == 0) {
+      printf("SpinEventLoopUntil[ST]: %llu spins in '%s'\n",
+             (unsigned long long)stSpins,
+             PromiseFlatCString(aVeryGoodReasonToDoThis).get());
+    }
+#endif
     bool didSomething = NS_ProcessNextEvent(thread, true);
 
     if (Behavior == ProcessFailureBehavior::IgnoreAndContinue) {

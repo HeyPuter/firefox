@@ -60,10 +60,13 @@ JS::FilenameValidationCallback js::gFilenameValidationCallback = nullptr;
 
 namespace js {
 
-#ifndef __wasi__
-bool gCanUseExtraThreads = true;
-#else
+#if defined(__wasi__) || \
+    (defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__))
+// Single-threaded wasm: no helper threads; parse/compile/GC tasks run
+// synchronously on the calling thread (the CanUseExtraThreads() fallbacks).
 bool gCanUseExtraThreads = false;
+#else
+bool gCanUseExtraThreads = true;
 #endif
 }  // namespace js
 

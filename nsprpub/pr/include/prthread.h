@@ -133,6 +133,17 @@ NSPR_API(PRThread*) PR_GetCurrentThread(void);
 #define PR_CurrentThread() PR_GetCurrentThread() /* for nspr1.0 compat. */
 #endif /* NO_NSPR_10_SUPPORT */
 
+#if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
+/*
+** Single-threaded wasm builds only: allocate a PRThread record with no OS
+** thread behind it, and swap which PRThread the sole real thread reports as
+** PR_GetCurrentThread() (returns the previous one). Used by xpcom to pump
+** virtual thread event queues cooperatively. See ptthread.c.
+*/
+NSPR_API(PRThread*) PR_STNewVirtualThread(void);
+NSPR_API(PRThread*) PR_STSwapCurrentThread(PRThread* thread);
+#endif
+
 /*
 ** Get the priority of "thread".
 */

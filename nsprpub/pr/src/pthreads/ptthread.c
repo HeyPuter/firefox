@@ -613,6 +613,47 @@ PR_IMPLEMENT(PRThread*) PR_GetCurrentThread(void) {
   return (PRThread*)thred;
 } /* PR_GetCurrentThread */
 
+#if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
+/*
+ * Single-threaded wasm: virtual PRThread records for cooperatively-pumped
+ * XPCOM threads. No OS thread is created; xpcom (nsThreadManager) swaps one
+ * of these in as the "current thread" while draining that thread's event
+ * queue on the sole real thread, so PR_GetCurrentThread()-based identity
+ * (nsIEventTarget::IsOnCurrentThread etc.) behaves as if the code ran on its
+ * own thread.
+ */
+PR_IMPLEMENT(PRThread*) PR_STNewVirtualThread(void) {
+  PRThread* thred;
+  if (!_pr_initialized) {
+    _PR_ImplicitInitialization();
+  }
+  thred = PR_NEWZAP(PRThread);
+  if (NULL == thred) {
+    return NULL;
+  }
+  /* FOREIGN: not joinable/managed by NSPR; identity comes from the pointer. */
+  thred->state = PT_THREAD_GLOBAL | PT_THREAD_FOREIGN;
+  thred->priority = PR_PRIORITY_NORMAL;
+  thred->id = pthread_self();
+  thred->idSet = PR_TRUE;
+#if defined(_PR_NICE_PRIORITY_SCHEDULING)
+  /* Nonzero, or PR_SetThreadPriority waits forever for the thread to start. */
+  thred->tid = 1;
+#endif
+  return thred;
+}
+
+PR_IMPLEMENT(PRThread*) PR_STSwapCurrentThread(PRThread* thred) {
+  void* prev;
+  if (!_pr_initialized) {
+    _PR_ImplicitInitialization();
+  }
+  _PT_PTHREAD_GETSPECIFIC(pt_book.key, prev);
+  pthread_setspecific(pt_book.key, thred);
+  return (PRThread*)prev;
+}
+#endif /* __EMSCRIPTEN__ && !__EMSCRIPTEN_PTHREADS__ */
+
 PR_IMPLEMENT(PRThreadScope) PR_GetThreadScope(const PRThread* thred) {
   return (thred->state & PT_THREAD_BOUND) ? PR_GLOBAL_BOUND_THREAD
                                           : PR_GLOBAL_THREAD;
@@ -637,6 +678,19 @@ PR_SetThreadPriority(PRThread* thred, PRThreadPriority newPri) {
   PRIntn rv;
 
   PR_ASSERT(NULL != thred);
+
+#if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
+  /* Single-threaded wasm: one real thread, no scheduler; just record it.
+   * (The nice-priority path otherwise waits on thred->tid forever for
+   * cooperatively-pumped virtual threads.) */
+  if ((PRIntn)PR_PRIORITY_FIRST > (PRIntn)newPri) {
+    newPri = PR_PRIORITY_FIRST;
+  } else if ((PRIntn)PR_PRIORITY_LAST < (PRIntn)newPri) {
+    newPri = PR_PRIORITY_LAST;
+  }
+  thred->priority = newPri;
+  return;
+#endif
 
   if ((PRIntn)PR_PRIORITY_FIRST > (PRIntn)newPri) {
     newPri = PR_PRIORITY_FIRST;

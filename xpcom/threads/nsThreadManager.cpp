@@ -292,6 +292,147 @@ NS_IMPL_CI_INTERFACE_GETTER(nsThreadManager, nsIThreadManager)
   return *sInstance;
 }
 
+#ifdef GECKO_ST_THREADS
+// --- Virtual-thread scheduler (single-threaded wasm) ---------------------
+// All XPCOM threads are event queues drained here, on the sole real thread.
+// The mozglue/NSPR condvar-wait hooks call STPump so that any blocking wait
+// (SpinEventLoopUntil, sync dispatch, monitor waits) makes forward progress
+// instead of deadlocking.
+namespace {
+struct STPumpHook {
+  bool (*mFn)(void*);
+  void* mClosure;
+};
+struct STSchedState {
+  nsTArray<RefPtr<nsThread>> mThreads;
+  nsTArray<STPumpHook> mHooks;
+  uint32_t mDepth = 0;
+};
+static STSchedState* sSTState = nullptr;
+static nsThread* sSTOverride = nullptr;
+
+STSchedState& STState() {
+  if (!sSTState) {
+    sSTState = new STSchedState();
+  }
+  return *sSTState;
+}
+
+}  // namespace
+
+// Bumped by the embedder at each xul_tick entry; a stuck serial while waits
+// spin marks a wedged tick (see STWaitHookThunk).
+extern "C" unsigned gecko_st_activity = 0;
+
+namespace {
+bool STWaitHookThunk() {
+  // Wall-clock wedge tripwire: if the embedder's tick serial hasn't advanced
+  // in 30s while waits keep firing, one tick is wedged in a wait whose
+  // condition nothing can satisfy (periodic timer/socket churn can mask it
+  // from progress-based detection). abort() surfaces the waiter's stack.
+  static unsigned sLastSeen = 0;
+  static double sLastChangeMs = 0;
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  double now = double(ts.tv_sec) * 1000.0 + double(ts.tv_nsec) / 1e6;
+  if (gecko_st_activity != sLastSeen || sLastChangeMs == 0) {
+    sLastSeen = gecko_st_activity;
+    sLastChangeMs = now;
+  } else if (now - sLastChangeMs > 30000) {
+    fprintf(stderr, "GeckoST: tick wedged >30s inside a wait, aborting\n");
+    abort();
+  }
+  return nsThreadManager::STPump();
+}
+}  // namespace
+
+// Defined in mozglue (ConditionVariable_posix.cpp); NSPR reaches it weakly.
+extern "C" bool (*gecko_st_wait_hook)(void);
+
+// Exported pump for the embedder's main-loop tick.
+extern "C" bool gecko_st_pump(void) { return nsThreadManager::STPump(); }
+
+void nsThreadManager::STRegisterVirtualThread(nsThread* aThread) {
+  STState().mThreads.AppendElement(aThread);
+}
+
+void nsThreadManager::STUnregisterVirtualThread(nsThread* aThread) {
+  if (sSTState) {
+    sSTState->mThreads.RemoveElement(aThread);
+  }
+}
+
+void nsThreadManager::STAddPumpHook(bool (*aHook)(void*), void* aClosure) {
+  STState().mHooks.AppendElement(STPumpHook{aHook, aClosure});
+}
+
+void nsThreadManager::STRemovePumpHook(bool (*aHook)(void*), void* aClosure) {
+  if (sSTState) {
+    sSTState->mHooks.RemoveElementsBy([&](const STPumpHook& h) {
+      return h.mFn == aHook && h.mClosure == aClosure;
+    });
+  }
+}
+
+nsThread* nsThreadManager::STCurrentOverride() { return sSTOverride; }
+
+bool nsThreadManager::STPump() {
+  if (!sSTState) {
+    return false;
+  }
+  STSchedState& st = *sSTState;
+  if (st.mDepth >= 8) {
+    return false;
+  }
+  st.mDepth++;
+  bool did = false;
+  nsTArray<STPumpHook> hooks = st.mHooks.Clone();
+  for (auto& hook : hooks) {
+    did |= hook.mFn(hook.mClosure);
+  }
+  // Copy: threads can register/unregister while being pumped.
+  nsTArray<RefPtr<nsThread>> threads = st.mThreads.Clone();
+  for (auto& thread : threads) {
+    did |= thread->STPumpOne();
+  }
+  if (!did) {
+    // Nothing else moved: the wait we were called from can only be satisfied
+    // by a MAIN-thread event (e.g. a queued in-process IPC dispatch). Drain a
+    // bounded batch, nested-event-loop style, matching what Gecko's blocking
+    // main-thread waits (SpinEventLoopUntil, sync IPC) already permit.
+    nsThread* main = nsThreadManager::get().mMainThread;
+    if (main && !main->mSTPumping) {
+      main->mSTPumping = true;
+      for (int i = 0; i < 32; i++) {
+        bool processed = false;
+        if (NS_FAILED(main->ProcessNextEvent(false, &processed)) ||
+            !processed) {
+          break;
+        }
+        did = true;
+      }
+      main->mSTPumping = false;
+    }
+  }
+  st.mDepth--;
+  return did;
+}
+
+mozilla::STAutoImpersonate::STAutoImpersonate(nsThread* aThread) {
+  mPrevOverride = sSTOverride;
+  sSTOverride = aThread;
+  mPrevPR = PR_STSwapCurrentThread(aThread->GetPRThread());
+  mPrevIsMain = sTLSIsMainThread.get();
+  sTLSIsMainThread.set(false);
+}
+
+mozilla::STAutoImpersonate::~STAutoImpersonate() {
+  sTLSIsMainThread.set(mPrevIsMain);
+  PR_STSwapCurrentThread(mPrevPR);
+  sSTOverride = mPrevOverride;
+}
+#endif  // GECKO_ST_THREADS
+
 nsThreadManager::nsThreadManager()
     : mCurThreadIndex(0),
       mMutex("nsThreadManager::mMutex"),
@@ -316,6 +457,11 @@ nsresult nsThreadManager::Init() {
   if (PR_NewThreadPrivateIndex(&mCurThreadIndex, ReleaseThread) == PR_FAILURE) {
     return NS_ERROR_FAILURE;
   }
+
+#ifdef GECKO_ST_THREADS
+  // From here on, every condvar wait pumps the virtual-thread scheduler.
+  gecko_st_wait_hook = &STWaitHookThunk;
+#endif
 
 #ifdef MOZ_CANARY
   const int flags = O_WRONLY | O_APPEND | O_CREAT | O_NONBLOCK;
@@ -559,6 +705,11 @@ already_AddRefed<TaskQueue> nsThreadManager::CreateBackgroundTaskQueue(
 }
 
 nsThread* nsThreadManager::GetCurrentThread() {
+#ifdef GECKO_ST_THREADS
+  if (sSTOverride) {
+    return sSTOverride;
+  }
+#endif
   // read thread local storage
   void* data = PR_GetThreadPrivate(mCurThreadIndex);
   if (data) {

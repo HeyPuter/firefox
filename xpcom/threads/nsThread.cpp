@@ -224,6 +224,12 @@ class nsThreadShutdownEvent : public Runnable {
     // Creates a cycle between `mThread` and the shutdown context which will be
     // broken when the thread exits.
     mThread->mShutdownContext = mShutdownContext;
+#ifdef GECKO_ST_THREADS
+    // Virtual threads have no MessageLoop of their own; MessageLoop::current()
+    // is the real thread's loop and must NOT be quit. STPumpOne notices
+    // mShutdownContext and runs STCompleteShutdown.
+    return NS_OK;
+#endif
     MessageLoop::current()->Quit();
 #ifdef MOZ_DIAGNOSTIC_ASSERT_ENABLED
     // Let's leave a trace that we passed here in the thread's name.
@@ -453,6 +459,84 @@ void nsThread::ThreadFunc(void* aArg) {
   self->mEventTarget->ClearCurrentThread();
 }
 
+#ifdef GECKO_ST_THREADS
+bool nsThread::STPumpOne() {
+  if (mSTPumping) {
+    return false;
+  }
+  mSTPumping = true;
+  bool did = false;
+  uint32_t drained = 0;
+  for (;;) {
+    bool processed = false;
+    mozilla::STAutoImpersonate imp(this);
+    // Non-blocking: ProcessNextEvent runs observers/direct tasks like a real
+    // thread's event loop iteration would.
+    if (NS_FAILED(ProcessNextEvent(false, &processed)) || !processed) {
+      break;
+    }
+    did = true;
+    if (++drained >= 10000) {
+      // A queue that never runs dry inside one pump means an event is
+      // re-dispatching itself; yield to the outer loop instead of wedging.
+      nsAutoCString name;
+      GetThreadName(name);
+      printf("nsThread::STPumpOne: 10000 events without drain on '%s'\n",
+             name.get());
+      break;
+    }
+  }
+  if (mShutdownContext) {
+    STCompleteShutdown();
+    did = true;
+  }
+  mSTPumping = false;
+  return did;
+}
+
+void nsThread::STCompleteShutdown() {
+  // ThreadFunc-tail equivalent, run on the real thread while impersonating
+  // this virtual thread.
+  using mozilla::ipc::BackgroundChild;
+
+  mozilla::STAutoImpersonate imp(this);
+
+  mEvents->RunShutdownTasks();
+
+  BackgroundChild::CloseForCurrentThread();
+
+  while (true) {
+    WaitForAllAsynchronousShutdowns();
+    if (mEvents->ShutdownIfNoPendingEvents()) {
+      break;
+    }
+    NS_ProcessPendingEvents(this);
+  }
+
+  nsThreadManager::STUnregisterVirtualThread(this);
+
+  NotNull<RefPtr<nsThreadShutdownContext>> context =
+      WrapNotNull(mShutdownContext);
+  mShutdownContext = nullptr;
+  MOZ_ASSERT(context->mTerminatingThread == this);
+  // The virtual PRThread record is leaked deliberately: no join happens, and
+  // stale identity comparisons must not alias a recycled allocation.
+  mThread = nullptr;
+
+  RefPtr<nsThread> joiningThread;
+  {
+    MutexAutoLock lock(context->mJoiningThreadMutex);
+    joiningThread = context->mJoiningThread.forget();
+    MOZ_RELEASE_ASSERT(joiningThread || context->mThreadLeaked);
+  }
+  if (joiningThread) {
+    nsCOMPtr<nsIRunnable> event = new nsThreadShutdownAckEvent(context);
+    MOZ_ALWAYS_SUCCEEDS(
+        joiningThread->Dispatch(event.forget(), NS_DISPATCH_NORMAL));
+  }
+}
+#endif  // GECKO_ST_THREADS
+
 void nsThread::InitCommon() {
   mThreadId = uint32_t(PlatformThread::CurrentId());
 
@@ -602,6 +686,37 @@ nsresult nsThread::Init(const nsACString& aName) {
   MOZ_ASSERT(!mThread);
 
   SetThreadNameInternal(aName);
+
+#ifdef GECKO_ST_THREADS
+  // Single-threaded wasm: no OS thread. Set up a virtual thread whose event
+  // queue is drained by nsThreadManager::STPump on the sole real thread.
+  {
+    nsThreadManager& tm = nsThreadManager::get();
+    {
+      OffTheBooksMutexAutoLock lock(tm.ThreadListMutex());
+      if (!tm.AllowNewXPCOMThreadsLocked()) {
+        return NS_ERROR_NOT_INITIALIZED;
+      }
+      mShutdownRequired = true;
+      tm.ThreadList().insertBack(this);
+    }
+    PRThread* vthread = PR_STNewVirtualThread();
+    if (!vthread) {
+      return NS_ERROR_OUT_OF_MEMORY;
+    }
+    mThread.exchange(vthread);
+    mEventTarget->SetCurrentThread(vthread);
+    {
+      mozilla::STAutoImpersonate imp(this);
+      InitCommon();
+      if (!aName.IsEmpty()) {
+        NS_SetCurrentThreadName(PromiseFlatCString(aName).get());
+      }
+    }
+    nsThreadManager::STRegisterVirtualThread(this);
+    return NS_OK;
+  }
+#endif
 
   PRThread* thread = nullptr;
 
@@ -884,9 +999,11 @@ void nsThread::ShutdownComplete(NotNull<nsThreadShutdownContext*> aContext) {
 
   MaybeRemoveFromThreadList();
 
+#ifndef GECKO_ST_THREADS
   // Now, it should be safe to join without fear of dead-locking.
   PR_JoinThread(aContext->mTerminatingPRThread);
   MOZ_ASSERT(!mThread);
+#endif
 
 #ifdef DEBUG
   nsCOMPtr<nsIThreadObserver> obs = mEvents->GetObserver();

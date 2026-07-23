@@ -886,8 +886,16 @@ void nsHostResolver::MaybeDispatchResolveHostTask() {
   nsCOMPtr<nsIRunnable> event =
       mozilla::NewRunnableMethod("nsHostResolver::ResolveHostTask", this,
                                  &nsHostResolver::ResolveHostTask);
+#if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
+  nsresult dispatchRv =
+      mResolverThreads->Dispatch(event, nsIEventTarget::DISPATCH_NORMAL);
+  printf("nsHostResolver[ST]: dispatched ResolveHostTask rv=0x%08x\n",
+         (unsigned)dispatchRv);
+  DebugOnly<nsresult> rv = dispatchRv;
+#else
   DebugOnly<nsresult> rv =
       mResolverThreads->Dispatch(event, nsIEventTarget::DISPATCH_NORMAL);
+#endif
   NS_WARNING_ASSERTION(NS_SUCCEEDED(rv),
                        "MaybeDispatchResolveHostTask: Dispatch failed");
 }
@@ -1142,6 +1150,10 @@ void nsHostResolver::ComputeEffectiveTRRMode(nsHostRecord* aRec) {
 
 // Kick-off a name resolve operation, using native resolver and/or TRR
 nsresult nsHostResolver::NameLookup(nsHostRecord* rec) {
+#if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
+  printf("nsHostResolver[ST]: NameLookup '%s' type=%d flags=0x%x\n",
+         rec->host.get(), (int)rec->type, (unsigned)rec->flags);
+#endif
   LOG(("NameLookup host:%s af:%" PRId16, rec->host.get(), rec->af));
   mQueue.mLock.AssertCurrentThreadOwns();
 
@@ -1216,6 +1228,10 @@ nsresult nsHostResolver::NameLookup(nsHostRecord* rec) {
     rv = NativeLookup(rec);
   }
 
+#if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
+  printf("nsHostResolver[ST]: NameLookup '%s' -> rv=0x%08x\n", rec->host.get(),
+         (unsigned)rv);
+#endif
   return rv;
 }
 
@@ -1813,8 +1829,15 @@ void nsHostResolver::ResolveHostTask() {
       return;
     }
 
+#if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
+    printf("nsHostResolver[ST]: GetAddrInfo('%s')...\n", rec->host.get());
+#endif
     nsresult status =
         GetAddrInfo(rec->host, rec->af, rec->flags, getter_AddRefs(ai), getTtl);
+#if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
+    printf("nsHostResolver[ST]: GetAddrInfo('%s') rv=0x%08x\n", rec->host.get(),
+           (unsigned)status);
+#endif
 
     mozilla::glean::networking::dns_native_count
         .EnumGet(rec->pb ? glean::networking::DnsNativeCountLabel::ePrivate

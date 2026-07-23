@@ -50,6 +50,13 @@ uintptr_t WJInternConstant(uint64_t valueBits);
 // at runtime so a GC-moved shape doesn't cause a permanent deopt. 0 if pool full.
 uintptr_t WJInternShape(uintptr_t shapeBits);
 
+// Intern a JSScript* for a deopt resume spill: returns the byte address of a
+// GC-traced+relocated pool slot holding the (relocatable) script pointer. The
+// emitted deopt LOADS the slot at runtime and stores it into gWJResumeScriptPtr, so
+// a COMPACTING GC that moved the script since compile-time doesn't spill a stale
+// pointer (was: baked I32Const(script) -> stale -> resume OOB). 0 if pool full.
+uintptr_t WJInternScript(uintptr_t scriptBits);
+
 // wjhelp() helper kinds (the f64 first argument to the imported "m"."help").
 enum WJHelpKind : int {
   WJH_RESUME = 1,   // deopt: rebuild a PBL frame from gWJResume* and run from pc

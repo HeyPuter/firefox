@@ -4,6 +4,7 @@
 
 #include "nsTimerImpl.h"
 #include "TimerThread.h"
+#include "nsThreadManager.h"
 
 #include "GeckoProfiler.h"
 #include "nsThreadUtils.h"
@@ -504,6 +505,25 @@ nsresult TimerThread::Init() {
   if (!mInitialized) {
     nsTimerEvent::Init();
 
+#ifdef GECKO_ST_THREADS
+    // Single-threaded wasm: TimerThread::Run is an unbounded wait loop and
+    // must never run. Due timers are fired by STPoll from the virtual-thread
+    // pump. mThread points at the main thread only so null-checks (Shutdown,
+    // IsOnTimerThread) keep working.
+    NS_GetMainThread(getter_AddRefs(mThread));
+    nsThreadManager::STAddPumpHook(&TimerThread::STPollStatic, this);
+    {
+      RefPtr r = MakeRefPtr<TimerObserverRunnable>(this);
+      if (NS_IsMainThread()) {
+        r->Run();
+      } else {
+        NS_DispatchToMainThread(r);
+      }
+    }
+    mInitialized = true;
+    return mThread ? NS_OK : NS_ERROR_FAILURE;
+#endif
+
     // We hold on to mThread to keep the thread alive.
     nsresult rv =
         NS_NewNamedThread("Timer", getter_AddRefs(mThread), this,
@@ -529,6 +549,27 @@ nsresult TimerThread::Init() {
 
   return NS_OK;
 }
+
+#ifdef GECKO_ST_THREADS
+bool TimerThread::STPollStatic(void* aClosure) {
+  return static_cast<TimerThread*>(aClosure)->STPoll();
+}
+
+bool TimerThread::STPoll() {
+  TimerThreadMonitorAutoLock lock(mMonitor);
+  if (mShutdown || mSleeping) {
+    return false;
+  }
+  mAllowedEarlyFiringMicroseconds = 250;
+  const uint64_t fired =
+      FireDueTimers(TimeDuration::FromMicroseconds(250));
+  if (!mShutdown) {
+    const auto [wakeupTime, wakeupTolerance] = ComputeWakeupTimeFromTimers();
+    mIntendedWakeupTime = wakeupTime;
+  }
+  return fired != 0;
+}
+#endif  // GECKO_ST_THREADS
 
 nsresult TimerThread::Shutdown() {
   MOZ_LOG(GetTimerLog(), LogLevel::Debug, ("TimerThread::Shutdown begin\n"));
@@ -575,7 +616,13 @@ nsresult TimerThread::Shutdown() {
     }
   }
 
+#ifdef GECKO_ST_THREADS
+  // mThread aliases the main thread in the single-threaded build; there is no
+  // Timer thread to shut down. Stop the pump's timer poll instead.
+  nsThreadManager::STRemovePumpHook(&TimerThread::STPollStatic, this);
+#else
   mThread->Shutdown();  // wait for the thread to die
+#endif
 
   nsTimerEvent::Shutdown();
 

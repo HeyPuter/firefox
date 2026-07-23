@@ -223,6 +223,39 @@ PR_IMPLEMENT(void) PR_AssertCurrentThreadOwnsLock(PRLock* lock) {
 #  define PT_NANOPERMICRO 1000UL
 #  define PT_BILLION 1000000000UL
 
+#if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
+/* Single-threaded wasm: no OS threads exist, so condvar waits can never be
+ * satisfied by another thread (the stub pthread_cond_*wait returns 0 at once,
+ * i.e. a spurious wakeup). Pump the xpcom virtual-thread scheduler instead so
+ * the awaited condition can make progress. Hooks are defined in mozglue
+ * (ConditionVariable_posix.cpp) and installed by nsThreadManager; weak so
+ * standalone NSPR links (no mozglue) stay functional. */
+extern int (*gecko_st_wait_hook)(void) __attribute__((weak));
+extern void (*gecko_st_idle_hook)(void) __attribute__((weak));
+static void pt_st_on_wait(void) {
+  static unsigned long long pt_st_no_progress = 0;
+  int progress = 0;
+  if (&gecko_st_wait_hook != NULL && gecko_st_wait_hook != NULL) {
+    progress = gecko_st_wait_hook();
+  }
+  if (!progress && &gecko_st_idle_hook != NULL && gecko_st_idle_hook != NULL) {
+    gecko_st_idle_hook();
+  }
+  /* Diagnostic: a wait loop that spins millions of times with zero scheduler
+   * progress is wedged on a condition nothing can satisfy. abort() so the
+   * wasm trap surfaces the waiting caller's full stack. */
+  if (progress) {
+    pt_st_no_progress = 0;
+  } else if (++pt_st_no_progress == 5000000ULL) {
+    fprintf(stderr, "pt_st_on_wait: 5M no-progress waits, aborting for stack\n");
+    abort();
+  }
+}
+#  define PT_ST_ON_WAIT() pt_st_on_wait()
+#else
+#  define PT_ST_ON_WAIT()
+#endif
+
 static PRIntn pt_TimedWait(pthread_cond_t* cv, pthread_mutex_t* ml,
                            PRIntervalTime timeout) {
   int rv;
@@ -363,6 +396,7 @@ PR_IMPLEMENT(PRStatus) PR_WaitCondVar(PRCondVar* cvar, PRIntervalTime timeout) {
    */
   cvar->lock->locked = PR_FALSE;
 
+  PT_ST_ON_WAIT();
   if (timeout == PR_INTERVAL_NO_TIMEOUT) {
     rv = pthread_cond_wait(&cvar->cv, &cvar->lock->mutex);
   } else {
@@ -659,6 +693,7 @@ PR_IMPLEMENT(PRStatus) PR_Wait(PRMonitor* mon, PRIntervalTime timeout) {
   rv = pthread_cond_signal(&mon->entryCV);
   PR_ASSERT(0 == rv);
 
+  PT_ST_ON_WAIT();
   if (timeout == PR_INTERVAL_NO_TIMEOUT) {
     rv = pthread_cond_wait(&mon->waitCV, &mon->lock);
   } else {

@@ -261,6 +261,16 @@ class nsSocketTransportService final : public nsPISocketTransportService,
 
   nsTArray<PRPollDesc> mPollList;
 
+#if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
+  // Single-threaded wasm: no Socket Thread Run() loop; the virtual-thread
+  // pump drives poll iterations instead (rate-limited, zero-timeout).
+  static bool STPollHook(void* aClosure);
+  bool STPollOnce();
+  void STDoPoll();
+  bool mSTPollPending = false;
+  mozilla::TimeStamp mSTLastPoll;
+#endif
+
   PRIntervalTime PollTimeout(
       PRIntervalTime now);  // computes ideal poll timeout
   nsresult DoPollIteration();

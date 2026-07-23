@@ -210,6 +210,13 @@ class MOZ_RAII AutoProfilerLabel {
   AutoProfilerLabel(const char* aLabel, const char* aDynamicString,
                     JS::ProfilingCategoryPair aCategoryPair,
                     uint32_t aFlags = 0) {
+#if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
+    // Single-threaded wasm: a wasm trap caught by the embedder's tick unwinds
+    // without running destructors, leaving pushed label frames behind and the
+    // stack permanently unbalanced (ends in a ~4GB frames-array abort). The
+    // label stack is diagnostics-only; keep it off.
+    mProfilingStack = nullptr;
+#else
     // Get the ProfilingStack from TLS.
     mProfilingStack = profiler::ThreadRegistration::WithOnThreadRefOr(
         [](profiler::ThreadRegistration::OnThreadRef aThread) {
@@ -221,6 +228,7 @@ class MOZ_RAII AutoProfilerLabel {
       mProfilingStack->pushLabelFrame(aLabel, aDynamicString, this,
                                       aCategoryPair, aFlags);
     }
+#endif
   }
 
   ~AutoProfilerLabel() {

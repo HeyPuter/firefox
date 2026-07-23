@@ -213,6 +213,14 @@ void ServiceWorkerRegistrar::GetRegistrations(
 
   // Waiting for data loaded.
   mMonitor.AssertCurrentThreadOwns();
+#if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
+  // Single-threaded wasm: the async load may never be scheduled; read the
+  // (WasmFS, synchronous) data file right here instead of waiting forever.
+  if (!mDataLoaded) {
+    printf("ServiceWorkerRegistrar[ST]: synchronous LoadData()\n");
+    LoadData();
+  }
+#endif
   while (!mDataLoaded) {
     mMonitor.Wait();
   }

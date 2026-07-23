@@ -4,6 +4,7 @@
 
 #include "nsSocketTransportService2.h"
 
+#include "nsThreadManager.h"
 #include "mozilla/Atomics.h"
 #include "mozilla/ChaosMode.h"
 #include "mozilla/glean/NetwerkMetrics.h"
@@ -721,6 +722,12 @@ int32_t nsSocketTransportService::Poll(PRIntervalTime ts) {
     }
   }
 
+#if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
+  // Single-threaded: PR_Poll must never block (the WasmFS wisp poll would
+  // busy-spin the whole timeout on the sole thread); the pump re-polls.
+  pollTimeout = PR_INTERVAL_NO_WAIT;
+#endif
+
   TimeStamp pollStart;
   if (Telemetry::CanRecordPrereleaseData()) {
     pollStart = TimeStamp::NowLoRes();
@@ -824,6 +831,32 @@ nsSocketTransportService::Init() {
 
   nsCOMPtr<nsIThread> thread;
 
+#if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
+  // Single-threaded wasm: the polling Run() loop must never execute. Create a
+  // plain virtual thread (like the content-process branch), initialize the
+  // poll-list state Run() would have set up (no pollable event -> busy-poll
+  // model), and let the scheduler pump drive zero-timeout poll iterations.
+  {
+    nsresult rv =
+        NS_NewNamedThread("Socket Thread", getter_AddRefs(thread), nullptr,
+                          {nsIThreadManager::DEFAULT_STACK_SIZE, false, false,
+                           Some(SOCKET_THREAD_LONGTASK_MS)});
+    NS_ENSURE_SUCCESS(rv, rv);
+
+    PRThread* prthread = nullptr;
+    thread->GetPRThread(&prthread);
+    gSocketThread = prthread;
+    mRawThread = thread;
+    {
+      MutexAutoLock lock(mLock);
+      mPollableEvent = nullptr;
+      PRPollDesc entry = {nullptr, PR_POLL_READ | PR_POLL_EXCEPT, 0};
+      mPollList[0] = entry;
+    }
+    nsThreadManager::STAddPumpHook(&nsSocketTransportService::STPollHook,
+                                   this);
+  }
+#else
   if (!XRE_IsContentProcess() ||
       StaticPrefs::network_allow_raw_sockets_in_content_processes_AtStartup()) {
     // Since we Poll, we can't use normal LongTask support in Main Process
@@ -847,6 +880,7 @@ nsSocketTransportService::Init() {
     gSocketThread = prthread;
     mRawThread = thread;
   }
+#endif
 
   {
     MutexAutoLock lock(mLock);
@@ -1368,6 +1402,44 @@ void nsSocketTransportService::Reset(bool aGuardLocals) {
     DetachSocketWithGuard(aGuardLocals, mIdleList, i);
   }
 }
+
+#if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
+bool nsSocketTransportService::STPollHook(void* aClosure) {
+  return static_cast<nsSocketTransportService*>(aClosure)->STPollOnce();
+}
+
+bool nsSocketTransportService::STPollOnce() {
+  if (!mInitialized || mShuttingDown || mSTPollPending) {
+    return false;
+  }
+  if (mActiveList.IsEmpty() && mIdleList.IsEmpty()) {
+    return false;
+  }
+  // Rate-limit so an idle pump can detect "no progress" and yield rather
+  // than treating perpetual re-polling as forward progress.
+  TimeStamp now = TimeStamp::Now();
+  if (!mSTLastPoll.IsNull() && (now - mSTLastPoll).ToMilliseconds() < 1.0) {
+    return false;
+  }
+  mSTLastPoll = now;
+  mSTPollPending = true;
+  nsCOMPtr<nsIRunnable> ev =
+      NewRunnableMethod("nsSocketTransportService::STDoPoll", this,
+                        &nsSocketTransportService::STDoPoll);
+  if (NS_FAILED(mRawThread->Dispatch(ev.forget(), NS_DISPATCH_NORMAL))) {
+    mSTPollPending = false;
+  }
+  return false;
+}
+
+void nsSocketTransportService::STDoPoll() {
+  mSTPollPending = false;
+  if (mShuttingDown) {
+    return;
+  }
+  DoPollIteration();
+}
+#endif
 
 nsresult nsSocketTransportService::DoPollIteration() {
   SOCKET_LOG(("STS poll iter\n"));

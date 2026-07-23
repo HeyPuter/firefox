@@ -24,6 +24,12 @@ class NeverDestroyed;
 
 class BackgroundEventTarget;
 
+// Single-threaded wasm build (no -pthread): XPCOM threads are virtualized as
+// event queues drained cooperatively on the sole real thread.
+#if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
+#  define GECKO_ST_THREADS 1
+#endif
+
 class nsThreadManager : public nsIThreadManager {
  public:
   NS_DECL_ISUPPORTS
@@ -103,6 +109,23 @@ class nsThreadManager : public nsIThreadManager {
     return mThreadList;
   }
 
+#ifdef GECKO_ST_THREADS
+  // --- Virtual-thread scheduler (single-threaded wasm) ---
+  // Virtual threads register here from nsThread::Init and are drained by
+  // STPump, which the condvar-wait hooks (mozglue/NSPR) and the embedder's
+  // main-loop tick invoke. Returns true if any event ran or timer fired.
+  static void STRegisterVirtualThread(nsThread* aThread);
+  static void STUnregisterVirtualThread(nsThread* aThread);
+  static bool STPump();
+  // Service polls (due timers, socket poll, ...) run at the start of every
+  // pump. A hook returns true if it did work.
+  static void STAddPumpHook(bool (*aHook)(void*), void* aClosure);
+  static void STRemovePumpHook(bool (*aHook)(void*), void* aClosure);
+  // Non-null while STPump impersonates a virtual thread; consulted by
+  // GetCurrentThread.
+  static nsThread* STCurrentOverride();
+#endif
+
  private:
   friend class mozilla::NeverDestroyed<nsThreadManager>;
 
@@ -144,6 +167,25 @@ class nsThreadManager : public nsIThreadManager {
   // Shared event target used for background runnables.
   RefPtr<BackgroundEventTarget> mBackgroundEventTarget MOZ_GUARDED_BY(mMutex);
 };
+
+#ifdef GECKO_ST_THREADS
+struct PRThread;
+namespace mozilla {
+// Makes a virtual nsThread the "current thread" (NS_GetCurrentThread,
+// PR_GetCurrentThread, NS_IsMainThread=false) for a scope, while its events
+// run on the sole real thread.
+class MOZ_RAII STAutoImpersonate {
+ public:
+  explicit STAutoImpersonate(nsThread* aThread);
+  ~STAutoImpersonate();
+
+ private:
+  PRThread* mPrevPR;
+  nsThread* mPrevOverride;
+  bool mPrevIsMain;
+};
+}  // namespace mozilla
+#endif
 
 #define NS_THREADMANAGER_CID                  \
   {/* 7a4204c6-e45a-4c37-8ebb-6709a22c917c */ \

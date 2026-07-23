@@ -10,6 +10,9 @@
 #include "mozilla/TimeStamp.h"
 
 #include <stdint.h>
+#if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
+#  include <stdio.h>
+#endif
 
 #include "jstypes.h"
 
@@ -492,6 +495,19 @@ class JS_PUBLIC_API ProfilingStack final {
     // This thread is the only one that ever changes the value of
     // stackPointer.
     uint32_t oldStackPointer = stackPointer;
+#if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
+    // Single-threaded wasm: a pop without a matching push (e.g. after a wasm
+    // trap unwound past pushed labels) must not wrap to 0xFFFFFFFF -- the
+    // next push would request a ~4GB frames array and abort.
+    if (oldStackPointer == 0) {
+      static bool reported = false;
+      if (!reported) {
+        reported = true;
+        printf("ProfilingStack[ST]: pop() underflow -- unbalanced label\n");
+      }
+      return;
+    }
+#endif
     stackPointer = oldStackPointer - 1;
   }
 

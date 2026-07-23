@@ -24,6 +24,18 @@ void ProfilingStack::ensureCapacitySlow() {
   MOZ_ASSERT(stackPointer >= capacity);
   const uint32_t kInitialCapacity = 4096 / sizeof(ProfilingStackFrame);
 
+#if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
+  // Single-threaded wasm diagnostic: a loop pushing labels without popping
+  // grows this without bound (ends in a moz_xmalloc(-1) abort). Report and
+  // drop the stack instead of crashing; only profiler fidelity is affected.
+  if (uint32_t(capacity) >= (1u << 20)) {
+    printf("ProfilingStack[ST]: runaway label stack, sp=%u cap=%u -- reset\n",
+           unsigned(stackPointer), unsigned(capacity));
+    stackPointer = 0;
+    return;
+  }
+#endif
+
   uint32_t sp = stackPointer;
 
   uint32_t newCapacity;

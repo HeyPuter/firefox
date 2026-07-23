@@ -55,6 +55,14 @@ void IOThread::Shutdown() {
 }
 
 void IOThread::StartThread() {
+#if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
+  // Single-threaded wasm: no OS threads. Bind the IPC I/O "thread" to the
+  // main thread's MessageLoop (single process: only same-process ports exist)
+  // and run Init() inline.
+  STBindToCurrentThread();
+  Init();
+  return;
+#else
   // Failure to create the IPC I/O thread is unrecoverable.
   // NOTE: This will block if successful for the `Init()` virtual method to have
   // been run.
@@ -62,12 +70,18 @@ void IOThread::StartThread() {
           base::Thread::Options{MessageLoop::TYPE_IO, /* stack size */ 0})) {
     MOZ_CRASH("Failed to create IPC I/O Thread");
   }
+#endif
 }
 
 void IOThread::StopThread() {
+#if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
+  CleanUp();
+  return;
+#else
   // This will block until CleanUp() has been called, and the IPC I/O thread has
   // been joined.
   Stop();
+#endif
 }
 
 //

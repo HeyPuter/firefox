@@ -130,6 +130,13 @@ class Thread : PlatformThread::Delegate {
   bool IsRunning() const { return thread_id_ != 0; }
 
  protected:
+#if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
+  // Single-threaded wasm: no OS thread exists. Bind this "thread"'s loop to
+  // the current (main) thread's MessageLoop so message_loop() and its event
+  // targets stay functional; work dispatched to it runs on the main loop.
+  void STBindToCurrentThread() { message_loop_ = MessageLoop::current(); }
+#endif
+
   // Called just prior to starting the message loop
   virtual void Init() {}
 

@@ -1286,6 +1286,15 @@ static bool EmitDeoptResumeInline(Encoder& e, WJBackend& be) {
            e.writeOp(Op::I32Const) && e.writeVarS32(val) &&
            e.writeOp(Op::I32Store) && e.writeVarU32(2) && e.writeVarU32(0);
   };
+  // Store *(uintptr_t*)slot (a GC-traced pool slot, relocated on every GC) into addr.
+  // Used for the deopt script spill: load the RELOCATED script from gWJScriptPool[slot]
+  // and store it into gWJResumeScriptPtr, so compaction can't leave a stale baked script.
+  auto storeI32FromSlot = [&](uintptr_t addr, uintptr_t slot) -> bool {
+    return e.writeOp(Op::I32Const) && e.writeVarS32(int32_t(addr)) &&
+           e.writeOp(Op::I32Const) && e.writeVarS32(int32_t(slot)) &&
+           e.writeOp(Op::I32Load) && e.writeVarU32(2) && e.writeVarU32(0) &&
+           e.writeOp(Op::I32Store) && e.writeVarU32(2) && e.writeVarU32(0);
+  };
 
   // DIAGNOSTIC: poison the resume-vals buffer before spilling, so that any slot
   // WJH_RESUME reads but the spill below did NOT write returns a recognizable
@@ -1437,9 +1446,22 @@ static bool EmitDeoptResumeInline(Encoder& e, WJBackend& be) {
     if (!storeI32(uintptr_t(&gWJResumePc[f]), int32_t(pcOff))) return false;
     if (!storeI32(uintptr_t(&gWJResumeStackDepth[f]), int32_t(outDepth)))
       return false;
-    if (!storeI32(uintptr_t(&gWJResumeScriptPtr[f]),
-                  int32_t(uintptr_t(info.script()))))
-      return false;
+    // Spill the resumed frame's JSScript. BAKING info.script() as an I32Const is STALE
+    // under a compacting GC (the script moves, the immutable wasm constant can't be
+    // rewritten -> resume reads a moved-away script -> script->function() garbage -> OOB;
+    // crypto/pako deopt-resume-under-compaction). Instead intern it into the traced+
+    // relocated gWJScriptPool and LOAD the slot at runtime so the CURRENT (relocated)
+    // script is spilled. GECKO_WJ_NOSCRIPTPOOL reverts to baking.
+    static int noScriptPool = WJGETENV("GECKO_WJ_NOSCRIPTPOOL") ? 1 : 0;
+    uintptr_t scrSlot =
+        noScriptPool ? 0 : js::wasm::WJInternScript(uintptr_t(info.script()));
+    if (scrSlot) {
+      if (!storeI32FromSlot(uintptr_t(&gWJResumeScriptPtr[f]), scrSlot)) return false;
+    } else {
+      if (!storeI32(uintptr_t(&gWJResumeScriptPtr[f]),
+                    int32_t(uintptr_t(info.script()))))
+        return false;
+    }
     if (!storeI32(uintptr_t(&gWJResumeNArgs[f]), int32_t(nargs))) return false;
     if (!storeI32(uintptr_t(&gWJResumeNLocals[f]), int32_t(nlocals))) return false;
     if (!storeI32(uintptr_t(&gWJResumeValsOff[f]), int32_t(frameValsOff)))
@@ -11775,8 +11797,15 @@ static bool EmitDepthCheck(Encoder& e, WJBackend& be) {
   // big-frame fn (few levels to overflow) from a small one. The limit is in BYTES
   // ~= V8's wasm execution-stack size minus a safety margin (GECKO_WJ_DEPTHLIMIT
   // overrides, in bytes).
+  // DEPTHLIMIT (bytes) must fire the guard BEFORE the HOST wasm-call-stack overflows
+  // (uncatchable RangeError). This is HOST-DEPENDENT: node's V8 wasm stack crashes at
+  // ~1.2-1.5M gWJJitDepth, but a BROWSER's V8 wasm stack is far smaller (~300-640K
+  // measured -> 700K crashed real sites). 150000 is conservative for a small browser
+  // stack while still reaching the engine's real recursion quota via the PBL tail (the
+  // deep tail runs in PBL -- see the WasmJitRunCall deep-recursion gate). MUST match the
+  // gate's default in WasmJitRuntime.cpp. GECKO_WJ_DEPTHLIMIT overrides (bytes).
   static int limit = WJGETENV("GECKO_WJ_DEPTHLIMIT")
-                         ? atoi(WJGETENV("GECKO_WJ_DEPTHLIMIT")) : 2500000;
+                         ? atoi(WJGETENV("GECKO_WJ_DEPTHLIMIT")) : 150000;
   int32_t fb = int32_t(be.frameBytesEst);
   int32_t dAddr = int32_t(uintptr_t(static_cast<void*>(&gWJJitDepth)));
   // savedDepthLocal = gWJJitDepth
@@ -11802,10 +11831,18 @@ static bool EmitDepthCheck(Encoder& e, WJBackend& be) {
       !e.writeVarS32(limit) || !e.writeOp(Op::I32GtS))
     return false;
   if (!e.writeOp(Op::If) || !e.writeFixedU8(0x40)) return false;
-  // THROW is the DEFAULT (GECKO_WJ_NODEPTHTHROW reverts to the flag-2 valve): a throw
-  // unwinds V8's wasm stack cleanly; the valve regrows it (PBL re-enters the JIT) and
-  // still crashes at deep recursion.
-  static int depthThrow = WJGETENV("GECKO_WJ_NODEPTHTHROW") ? 0 : 1;
+  // The flag-2 DEOPT-TO-PBL VALVE is the DEFAULT (GECKO_WJ_DEPTHTHROW opts into throw).
+  // With DEPTHLIMIT tuned BELOW V8's wasm-stack crash, the valve fires in time and
+  // SELF-LIMITS: each re-entry's prologue immediately re-deopts (gWJJitDepth still >
+  // limit), so the deep tail runs interpreted in PBL on the 64MB linear stack under
+  // the engine's REAL recursion quota -> reaches ~the SpiderMonkey default recursion
+  // depth and throws a CATCHABLE "too much recursion" beyond it (== PBL), NOT the
+  // uncatchable V8 RangeError. (The prior default was THROW, which fired far below the
+  // real limit for big-frame fns and, at the old too-high 2.5M limit, let V8 crash
+  // uncatchably for small-frame fns -- the "recursion InternalError on real sites" bug.
+  // Validated: depth/sum reach ~PBL depth, big-frame matches PBL exactly, sum(15000/
+  // 50000) throw catchably, shallow recursion (fib) is unaffected full-speed JIT.)
+  static int depthThrow = WJGETENV("GECKO_WJ_DEPTHTHROW") ? 1 : 0;
   if (depthThrow) {
     // THROW MODE: raise the catchable over-recursion exception and propagate out.
     // A throw UNWINDS V8's wasm execution stack cleanly (each frame returns the

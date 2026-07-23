@@ -213,6 +213,15 @@ class nsThread : public nsIThreadInternal,
 
   void WaitForAllAsynchronousShutdowns();
 
+#if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
+  // Single-threaded wasm: drain this virtual thread's pending events on the
+  // sole real thread (impersonating it). Returns true if any event ran.
+  bool STPumpOne();
+  // ThreadFunc-tail equivalent for virtual threads: runs once the shutdown
+  // event has set mShutdownContext.
+  void STCompleteShutdown();
+#endif
+
   static const uint32_t kRunnableNameBufSize = 1000;
   static mozilla::Array<char, kRunnableNameBufSize> sMainThreadRunnableName;
 
@@ -282,6 +291,12 @@ class nsThread : public nsIThreadInternal,
   uint32_t mThreadId;
 
   uint32_t mNestedEventLoopDepth;
+
+#if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
+  // Reentrancy guard: STPump must not re-drain a virtual thread that is
+  // already mid-event (its nested waits pump the OTHER threads instead).
+  bool mSTPumping = false;
+#endif
 
   mozilla::Atomic<bool> mShutdownRequired;
 

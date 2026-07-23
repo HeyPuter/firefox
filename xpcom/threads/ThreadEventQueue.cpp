@@ -171,6 +171,16 @@ already_AddRefed<nsIRunnable> ThreadEventQueue::GetEvent(
       }
 
       AUTO_PROFILER_LABEL("ThreadEventQueue::GetEvent::Wait", IDLE);
+#if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
+      // Single-threaded: Wait() pumps the virtual-thread scheduler and returns
+      // immediately (spurious wake), so this loop busy-spins until an event
+      // arrives. Self-report runaway spins to identify wedged waits.
+      static uint64_t stWaits = 0;
+      if ((++stWaits & 0xFFFFF) == 0) {
+        printf("ThreadEventQueue::GetEvent[ST]: %llu empty-queue waits\n",
+               (unsigned long long)stWaits);
+      }
+#endif
       mEventsAvailable.Wait();
     }
   }

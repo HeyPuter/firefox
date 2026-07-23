@@ -53,6 +53,42 @@ static void moz_timespecadd(struct timespec* lhs, struct timespec* rhs,
 }
 #endif
 
+#if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
+// Single-threaded wasm: there are no OS threads, so a condvar wait can never
+// be satisfied by another thread. Emscripten's stub pthread_cond_(timed)wait
+// returns 0 immediately (a permitted spurious wakeup), which keeps wait loops
+// from deadlocking but makes no forward progress. This hook lets xpcom pump
+// the virtual-thread scheduler (drain cooperatively-scheduled event queues,
+// fire due timers) on every wait so the condition being waited on can actually
+// become true. Returns true if any work was done. The idle hook is invoked
+// when a wait made no progress (the embedder may yield to the JS event loop
+// there, briefly).
+extern "C" {
+bool (*gecko_st_wait_hook)(void) = nullptr;
+void (*gecko_st_idle_hook)(void) = nullptr;
+}
+static void GeckoSTOnWait() {
+  static unsigned long long sNoProgress = 0;
+  bool progress = gecko_st_wait_hook ? gecko_st_wait_hook() : false;
+  if (!progress && gecko_st_idle_hook) {
+    gecko_st_idle_hook();
+  }
+  // Diagnostic: millions of consecutive no-progress waits = wedged on a
+  // condition nothing can satisfy; abort() so the trap shows the waiter.
+  if (progress) {
+    sNoProgress = 0;
+  } else if (++sNoProgress == 5000000ULL) {
+    fprintf(stderr, "GeckoSTOnWait: 5M no-progress waits, aborting for stack\n");
+    abort();
+  }
+}
+#  define GECKO_ST_ON_WAIT() GeckoSTOnWait()
+#else
+#  define GECKO_ST_ON_WAIT() \
+    do {                     \
+    } while (0)
+#endif
+
 mozilla::detail::ConditionVariableImpl::ConditionVariableImpl() {
 #ifdef CV_USE_CLOCK_API
   pthread_condattr_t attr;
@@ -89,6 +125,7 @@ void mozilla::detail::ConditionVariableImpl::notify_all() {
 }
 
 void mozilla::detail::ConditionVariableImpl::wait(MutexImpl& lock) {
+  GECKO_ST_ON_WAIT();
   int r = pthread_cond_wait(&mCond, &lock.mMutex);
   MOZ_RELEASE_ASSERT(r == 0);
 }
@@ -99,6 +136,23 @@ mozilla::CVStatus mozilla::detail::ConditionVariableImpl::wait_for(
     wait(lock);
     return CVStatus::NoTimeout;
   }
+
+#if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
+  // Pump instead of blocking; report Timeout only when the deadline really
+  // elapsed so `while (wait_for(..) != Timeout)` loops stay time-bounded and
+  // periodic waits don't fire early.
+  {
+    struct timespec st_start;
+    clock_gettime(CLOCK_MONOTONIC, &st_start);
+    GECKO_ST_ON_WAIT();
+    struct timespec st_now;
+    clock_gettime(CLOCK_MONOTONIC, &st_now);
+    double elapsed_ms = (st_now.tv_sec - st_start.tv_sec) * 1000.0 +
+                        (st_now.tv_nsec - st_start.tv_nsec) / 1e6;
+    return elapsed_ms >= a_rel_time.ToMilliseconds() ? CVStatus::Timeout
+                                                     : CVStatus::NoTimeout;
+  }
+#endif
 
   int r;
 

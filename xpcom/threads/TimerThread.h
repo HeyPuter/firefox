@@ -228,6 +228,13 @@ class TimerThread final : public mozilla::Runnable, public nsIObserver {
   uint32_t AllowedEarlyFiringMicroseconds();
   nsresult GetTimers(nsTArray<RefPtr<nsITimer>>& aRetVal);
 
+#if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
+  // Single-threaded wasm: no Timer thread exists; the virtual-thread pump
+  // polls due timers here instead of TimerThread::Run's wait loop.
+  static bool STPollStatic(void* aClosure);
+  bool STPoll();
+#endif
+
  private:
   ~TimerThread();
 

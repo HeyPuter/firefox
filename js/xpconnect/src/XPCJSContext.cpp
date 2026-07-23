@@ -430,7 +430,14 @@ class WatchdogManager {
   Watchdog* GetWatchdog() { return mWatchdog.get(); }
 
   void RefreshWatchdog() {
+#if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
+    // Single-threaded wasm: the watchdog is an OS thread in an unbounded
+    // sleep loop; there is no thread to run it on and PR_CreateThread would
+    // MOZ_CRASH. Slow-script interruption is unavailable.
+    bool wantWatchdog = false;
+#else
     bool wantWatchdog = Preferences::GetBool("dom.use_watchdog", true);
+#endif
     if (wantWatchdog != !!mWatchdog) {
       if (wantWatchdog) {
         StartWatchdog();

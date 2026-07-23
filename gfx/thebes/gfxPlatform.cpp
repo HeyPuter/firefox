@@ -1370,8 +1370,16 @@ void gfxPlatform::InitLayersIPC() {
       CompositeProcessD3D11FencesHolderMap::Init();
 #endif
       RemoteTextureMap::Init();
+#if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
+      // Single-threaded wasm: WebRender's Rust rayon pool (wr_thread_pool_new)
+      // panics with no threads to spawn. The embedder paints via
+      // RenderDocument + blit (no compositor session), so the Renderer thread
+      // is not needed.
+      printf("gfxPlatform[ST]: skipping wr::RenderThread::Start (no threads)\n");
+#else
       wr::RenderThread::Start(GPUProcessManager::Get()->AllocateNamespace());
       image::ImageMemoryReporter::InitForWebRender();
+#endif
     }
 
     layers::CompositorThreadHolder::Start();
@@ -4238,11 +4246,15 @@ void gfxPlatform::DisableGPUProcess() {
   CompositeProcessD3D11FencesHolderMap::Init();
 #endif
   RemoteTextureMap::Init();
+#if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
+  printf("gfxPlatform[ST]: skipping wr::RenderThread::Start (no threads)\n");
+#else
   // We need to initialize the parent process to prepare for WebRender if we
   // did not end up disabling it, despite losing the GPU process.
   wr::RenderThread::Start(GPUProcessManager::Get()->AllocateNamespace());
   gfx::CanvasRenderThread::Start();
   image::ImageMemoryReporter::InitForWebRender();
+#endif
 }
 
 /* static */ void gfxPlatform::DisableRemoteCanvas() {

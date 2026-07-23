@@ -147,6 +147,31 @@ nsresult nsThreadPool::PutEvent(already_AddRefed<nsIRunnable> aEvent,
     return NS_ERROR_NOT_AVAILABLE;
   }
 
+#ifdef GECKO_ST_THREADS
+  // Single-threaded wasm: pool workers' Run() wait loop must never execute.
+  // Route every pool event to one virtual nsThread (created without an
+  // initial runnable) that the scheduler pumps; pool concurrency semantics
+  // (arbitrary order, no thread affinity) permit this.
+  {
+    nsCOMPtr<nsIThread> thread;
+    if (mThreads.Count() > 0) {
+      thread = mThreads.ObjectAt(0);
+    } else {
+      // blockDispatch must be OFF: this bypass dispatches directly to the
+      // thread (real pools feed workers via the pool queue instead).
+      nsresult rv = NS_NewNamedThread(
+          mThreadNaming.GetNextThreadName(mName), getter_AddRefs(thread),
+          nullptr, {.stackSize = mStackSize, .blockDispatch = false});
+      if (NS_WARN_IF(NS_FAILED(rv))) {
+        return rv;
+      }
+      mThreads.AppendObject(thread);
+    }
+    LogRunnable::LogDispatch(event);
+    return thread->Dispatch(event.forget(), NS_DISPATCH_NORMAL);
+  }
+#endif
+
   LogRunnable::LogDispatch(event);
   mEvents.PutEvent(event.forget(), EventQueuePriority::Normal, aProofOfLock);
 
@@ -623,6 +648,11 @@ nsThreadPool::ShutdownWithTimeout(int32_t aTimeoutMs) {
   nsCOMPtr<nsIThreadPoolListener> listener;
   {
     MutexAutoLock lock(mMutex);
+#ifdef GECKO_ST_THREADS
+    // Virtual pool threads never enter Run(), which is what removes a thread
+    // from mThreads; they were shut down via BeginShutdown above.
+    mThreads.Clear();
+#endif
     MOZ_RELEASE_ASSERT(mThreads.IsEmpty(),
                        "Thread wasn't removed from mThreads");
     listener = mListener.forget();
