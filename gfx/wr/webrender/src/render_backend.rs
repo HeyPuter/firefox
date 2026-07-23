@@ -899,6 +899,26 @@ impl RenderBackend {
         }
     }
 
+    // Single-threaded wasm: process all currently-pending API messages without
+    // blocking. `frame_counter` persists across calls (held by the ST driver).
+    // Returns false once the backend has shut down (stop pumping it).
+    #[cfg(gecko_st)]
+    pub fn run_once(&mut self, frame_counter: &mut u32) -> bool {
+        loop {
+            match self.api_rx.try_recv() {
+                Ok(msg) => {
+                    if !matches!(
+                        self.process_api_msg(msg, frame_counter),
+                        RenderBackendStatus::Continue
+                    ) {
+                        return false;
+                    }
+                }
+                Err(_) => return true,
+            }
+        }
+    }
+
     fn process_transaction(
         &mut self,
         mut txns: Vec<Box<BuiltTransaction>>,

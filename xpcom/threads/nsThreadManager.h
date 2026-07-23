@@ -183,6 +183,10 @@ class MOZ_RAII STAutoImpersonate {
   PRThread* mPrevPR;
   nsThread* mPrevOverride;
   bool mPrevIsMain;
+  nsThread* mThread;
+  void* mPrevCx;
+  void* mPrevCCData;
+  void* mPrevGCCx;
 };
 }  // namespace mozilla
 #endif

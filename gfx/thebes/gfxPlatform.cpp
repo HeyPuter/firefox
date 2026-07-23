@@ -17,6 +17,11 @@
 #include "mozilla/webrender/webrender_ffi.h"
 #include "mozilla/gfx/BuildConstants.h"
 #include "mozilla/gfx/gfxConfigManager.h"
+#if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
+#  include "nsThreadManager.h"
+// Cooperative WebRender pipeline stepper (gfx/wr/webrender/src/renderer/init.rs).
+extern "C" bool wr_st_pump();
+#endif
 #include "mozilla/gfx/gfxVars.h"
 #include "mozilla/gfx/GPUProcessManager.h"
 #include "mozilla/gfx/GraphicsMessages.h"
@@ -1370,15 +1375,15 @@ void gfxPlatform::InitLayersIPC() {
       CompositeProcessD3D11FencesHolderMap::Init();
 #endif
       RemoteTextureMap::Init();
-#if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
-      // Single-threaded wasm: WebRender's Rust rayon pool (wr_thread_pool_new)
-      // panics with no threads to spawn. The embedder paints via
-      // RenderDocument + blit (no compositor session), so the Renderer thread
-      // is not needed.
-      printf("gfxPlatform[ST]: skipping wr::RenderThread::Start (no threads)\n");
-#else
       wr::RenderThread::Start(GPUProcessManager::Get()->AllocateNamespace());
       image::ImageMemoryReporter::InitForWebRender();
+#if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
+      // Single-threaded wasm: WebRender's RenderBackend/SceneBuilder run
+      // cooperatively (no spawned threads -- see gfx/wr .../init.rs gecko_st).
+      // Register their stepper into the ST scheduler so the pipeline advances.
+      nsThreadManager::STAddPumpHook(
+          [](void*) -> bool { return wr_st_pump(); }, nullptr);
+      printf("gfxPlatform[ST]: RenderThread started; wr_st_pump registered\n");
 #endif
     }
 

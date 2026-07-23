@@ -3833,13 +3833,29 @@ void WorkerPrivate::DoRunLoop(JSContext* aCx) {
   // Now that we've done that, we can go ahead and set up our AutoJSAPI.  We
   // can't before this point, because it can't find the right JSContext before
   // then, since it gets it from our mJSContext.
+#if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
+  // Single-threaded wasm: the AutoJSAPI must outlive individual pump
+  // iterations, so keep it on the WorkerPrivate rather than the stack.
+  mSTJsapi = MakeUnique<AutoJSAPI>();
+  mSTJsapi->Init();
+  MOZ_ASSERT(mSTJsapi->cx() == aCx);
+#else
   AutoJSAPI jsapi;
   jsapi.Init();
   MOZ_ASSERT(jsapi.cx() == aCx);
+#endif
 
   EnableMemoryReporter();
 
   InitializeGCTimers();
+
+#if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
+  // Setup is done; the event loop runs cooperatively via DoRunLoopStepST()
+  // driven by a scheduler pump hook (see WorkerThreadPrimaryRunnable::Run).
+  mSTCheckFinalGCCC =
+      StaticPrefs::dom_workers_GCCC_on_potentially_last_event();
+  return;
+#endif
 
   bool checkFinalGCCC =
       StaticPrefs::dom_workers_GCCC_on_potentially_last_event();
@@ -4126,6 +4142,215 @@ void WorkerPrivate::DoRunLoop(JSContext* aCx) {
   MOZ_CRASH("Shouldn't get here!");
 }
 
+#if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
+// One non-blocking iteration of the DoRunLoop body for the single-threaded
+// cooperative scheduler. Returns true once the worker has reached Dead (the
+// loop-portion teardown has run); the caller then finishes worker teardown.
+// Returns false while the worker is still alive (call again next pump).
+bool WorkerPrivate::DoRunLoopStepST(bool* aDidWork) {
+  *aDidWork = false;
+  if (mSTInStep) {
+    // Re-entrant (a nested sync loop pumped the scheduler). Skip; the in-flight
+    // step / sync loop will process the worker's events.
+    return false;
+  }
+  auto data = mWorkerThreadAccessible.Access();
+  JSContext* aCx = mJSContext;
+  if (!aCx) {
+    // Already went Dead on a previous step.
+    return true;
+  }
+  mSTInStep = true;
+  auto stepGuard = MakeScopeExit([&] { mSTInStep = false; });
+  RefPtr<WorkerThread> thread;
+  {
+    MutexAutoLock lock(mMutex);
+    thread = mThread;
+  }
+
+  bool debuggerRunnablesPending = false;
+  bool normalRunnablesPending = false;
+  auto noRunnablesPendingAndKeepAlive =
+      [&debuggerRunnablesPending, &normalRunnablesPending, &thread, this]()
+          MOZ_REQUIRES(mMutex) {
+            debuggerRunnablesPending = !mDebuggerQueue.IsEmpty();
+            normalRunnablesPending = NS_HasPendingEvents(thread);
+
+            bool anyRunnablesPending = !mControlQueue.IsEmpty() ||
+                                       debuggerRunnablesPending ||
+                                       normalRunnablesPending;
+            bool keepWorkerAlive = mStatus == Running || HasActiveWorkerRefs();
+
+            return (!anyRunnablesPending && keepWorkerAlive);
+          };
+
+  WorkerStatus currentStatus;
+
+  if (mSTCheckFinalGCCC) {
+    bool mayNeedFinalGCCC = false;
+    {
+      MutexAutoLock lock(mMutex);
+      currentStatus = mStatus;
+      mayNeedFinalGCCC =
+          (mStatus >= Canceling && HasActiveWorkerRefs() &&
+           !debuggerRunnablesPending && !normalRunnablesPending &&
+           data->mPerformedShutdownAfterLastContentTaskExecuted);
+    }
+    if (mayNeedFinalGCCC) {
+#  ifdef MOZ_DIAGNOSTIC_ASSERT_ENABLED
+      data->mIsPotentiallyLastGCCCRunning = true;
+#  endif
+      GarbageCollectInternal(aCx, true /* aShrinking */,
+                             true /* aCollectChildren */);
+#  ifdef MOZ_DIAGNOSTIC_ASSERT_ENABLED
+      data->mIsPotentiallyLastGCCCRunning = false;
+#  endif
+    }
+  }
+
+  {
+    MutexAutoLock lock(mMutex);
+    if (mSTCheckFinalGCCC && currentStatus != mStatus) {
+      // Status moved while checking for a needed GC/CC; re-check next pump.
+      return false;
+    }
+
+    // COOPERATIVE IDLE: the blocking build spins WaitForWorkerEvents() here.
+    // Instead, if there is nothing to do and the worker should stay alive,
+    // yield back to the browser and resume on the next pump.
+    if (noRunnablesPendingAndKeepAlive()) {
+      thread->SetRunningEventDelay(TimeDuration(), TimeStamp());
+      mWorkerLoopIsIdle = true;
+      return false;
+    }
+    mWorkerLoopIsIdle = false;
+    *aDidWork = true;
+
+    auto result = ProcessAllControlRunnablesLocked();
+    if (result != ProcessAllControlRunnablesResult::Nothing) {
+      (void)noRunnablesPendingAndKeepAlive();
+    }
+
+    currentStatus = mStatus;
+  }
+
+  if (currentStatus >= Closing &&
+      !data->mPerformedShutdownAfterLastContentTaskExecuted) {
+    data->mPerformedShutdownAfterLastContentTaskExecuted.Flip();
+    if (data->mScope) {
+      data->mScope->NoteTerminating();
+      data->mScope->DisconnectGlobalTeardownObservers();
+      if (WebTaskScheduler* scheduler = data->mScope->GetExistingScheduler()) {
+        scheduler->Disconnect();
+      }
+    }
+  }
+
+  if (currentStatus != Running && !HasActiveWorkerRefs() &&
+      !normalRunnablesPending && !debuggerRunnablesPending) {
+    if (currentStatus == Canceling) {
+      NotifyInternal(Killing);
+#  ifdef DEBUG
+      {
+        MutexAutoLock lock(mMutex);
+        currentStatus = mStatus;
+      }
+      MOZ_ASSERT(currentStatus == Killing);
+#  else
+      currentStatus = Killing;
+#  endif
+    }
+
+    if (currentStatus == Killing) {
+      {
+        MutexAutoLock lock(mMutex);
+        if (NS_HasPendingEvents(thread) || !mDebuggerQueue.IsEmpty()) {
+          return false;
+        }
+      }
+
+      if (data->mScope) {
+        data->mScope->NoteShuttingDown();
+      }
+      if (mRemoteWorkerNonLifeCycleOpController) {
+        mRemoteWorkerNonLifeCycleOpController->TransistionStateToKilled();
+        mRemoteWorkerNonLifeCycleOpController = nullptr;
+      }
+
+      ReportUseCounters();
+      PromiseDebugging::FlushUncaughtRejections();
+      ShutdownGCTimers();
+      DisableMemoryReporter();
+
+      nsCOMPtr<nsITimer> timer;
+      {
+        MutexAutoLock lock(mMutex);
+        mStatus = Dead;
+        while (mDispatchingControlRunnables) {
+          mCondVar.Wait();
+        }
+        mJSContext = nullptr;
+        mDebuggerInterruptTimer.swap(timer);
+      }
+      timer = nullptr;
+
+      if (!mControlQueue.IsEmpty()) {
+        WorkerRunnable* runnable = nullptr;
+        while (mControlQueue.Pop(runnable)) {
+          runnable->Cancel();
+          runnable->Release();
+        }
+      }
+
+      UnlinkTimeouts();
+      // The persistent AutoJSAPI is no longer needed; drop it before the
+      // caller destroys the WorkerJSContext.
+      mSTJsapi = nullptr;
+      return true;
+    }
+  }
+
+  if (debuggerRunnablesPending || normalRunnablesPending) {
+    SetGCTimerMode(PeriodicTimer);
+  }
+
+  if (debuggerRunnablesPending) {
+    ProcessSingleDebuggerRunnable();
+
+    {
+      MutexAutoLock lock(mMutex);
+      debuggerRunnablesPending = !mDebuggerQueue.IsEmpty();
+    }
+
+    if (debuggerRunnablesPending) {
+      WorkerDebuggerGlobalScope* globalScope = DebuggerGlobalScope();
+      if (globalScope) {
+        JSAutoRealm ar(aCx, globalScope->GetGlobalJSObject());
+        JS_MaybeGC(aCx);
+      }
+    }
+  } else if (normalRunnablesPending) {
+    NS_ProcessNextEvent(thread, false);
+
+    normalRunnablesPending = NS_HasPendingEvents(thread);
+    if (normalRunnablesPending && GlobalScope()) {
+      JSAutoRealm ar(aCx, GlobalScope()->GetGlobalJSObject());
+      JS_MaybeGC(aCx);
+    }
+  }
+
+  if (currentStatus < Canceling) {
+    UpdateCCFlag(CCFlag::CheckBackgroundActors);
+  }
+
+  if (!debuggerRunnablesPending && !normalRunnablesPending) {
+    SetGCTimerMode(IdleTimer);
+  }
+
+  return false;
+}
+#endif  // __EMSCRIPTEN__ && !__EMSCRIPTEN_PTHREADS__
+
 namespace {
 /**
  * If there is a current CycleCollectedJSContext, return its recursion depth,
@@ -4283,7 +4508,17 @@ UniquePtr<ClientSource> WorkerPrivate::CreateClientSource() {
   // service worker.  So avoid the sync overhead here if we are starting a
   // service worker or a chrome worker.
   if (Kind() != WorkerKindService && !IsChromeWorker()) {
+#if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
+    // Single-threaded wasm: WorkerSyncPing does a synchronous IPC round-trip to
+    // the parent Client actor purely to avoid a main-thread/worker ordering
+    // race (a ClientHandle being created before our ClientSource IPC lands).
+    // Under the cooperative scheduler that sync ping doesn't resolve, and the
+    // race it guards against is far less likely with deterministic single-
+    // threaded ordering and no active controlling service worker. Skip it.
+    (void)clientSource;
+#else
     clientSource->WorkerSyncPing(this);
+#endif
   }
 
   return clientSource;

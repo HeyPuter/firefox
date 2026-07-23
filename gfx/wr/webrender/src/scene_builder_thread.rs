@@ -321,16 +321,52 @@ impl SceneBuilderThread {
 
         loop {
             tracy_begin_frame!("scene_builder_thread");
+            let keep_going = self.handle_scene_msg(self.rx.recv().ok());
+            if let Some(ref hooks) = self.hooks {
+                hooks.poke();
+            }
+            tracy_end_frame!("scene_builder_thread");
+            if !keep_going {
+                break;
+            }
+        }
 
-            match self.rx.recv() {
-                Ok(SceneBuilderRequest::WakeUp) => {}
-                Ok(SceneBuilderRequest::Flush(tx)) => {
+        if let Some(ref hooks) = self.hooks {
+            hooks.deregister();
+        }
+    }
+
+    // Single-threaded wasm: process all currently-pending scene-builder
+    // requests without blocking. Returns false once shut down.
+    #[cfg(gecko_st)]
+    pub fn run_once(&mut self) -> bool {
+        loop {
+            match self.rx.try_recv() {
+                Ok(req) => {
+                    if !self.handle_scene_msg(Some(req)) {
+                        return false;
+                    }
+                    if let Some(ref hooks) = self.hooks {
+                        hooks.poke();
+                    }
+                }
+                Err(_) => return true,
+            }
+        }
+    }
+
+    // Handle one scene-builder request (or a recv error). Returns false to
+    // stop the loop (shutdown / channel closed).
+    fn handle_scene_msg(&mut self, msg: Option<SceneBuilderRequest>) -> bool {
+        match msg {
+                Some(SceneBuilderRequest::WakeUp) => {}
+                Some(SceneBuilderRequest::Flush(tx)) => {
                     self.send(SceneBuilderResult::FlushComplete(tx));
                 }
-                Ok(SceneBuilderRequest::SetFlags(debug_flags)) => {
+                Some(SceneBuilderRequest::SetFlags(debug_flags)) => {
                     self.debug_flags = debug_flags;
                 }
-                Ok(SceneBuilderRequest::Transactions(txns)) => {
+                Some(SceneBuilderRequest::Transactions(txns)) => {
                     let built_txns : Vec<Box<BuiltTransaction>> = txns.into_iter()
                         .map(|txn| self.process_transaction(*txn))
                         .collect();
@@ -345,83 +381,73 @@ impl SceneBuilderThread {
                     self.recycler.recycle_built_scene();
                     self.tile_pool.cleanup();
                 }
-                Ok(SceneBuilderRequest::AddDocument(document_id, initial_size)) => {
+                Some(SceneBuilderRequest::AddDocument(document_id, initial_size)) => {
                     let old = self.documents.insert(document_id, Document::new(
                         initial_size.into(),
                     ));
                     debug_assert!(old.is_none());
                 }
-                Ok(SceneBuilderRequest::DeleteDocument(document_id)) => {
+                Some(SceneBuilderRequest::DeleteDocument(document_id)) => {
                     self.documents.remove(&document_id);
                     self.send(SceneBuilderResult::DeleteDocument(document_id));
                 }
-                Ok(SceneBuilderRequest::ClearNamespace(id)) => {
+                Some(SceneBuilderRequest::ClearNamespace(id)) => {
                     self.documents.retain(|doc_id, _doc| doc_id.namespace_id != id);
                     self.send(SceneBuilderResult::ClearNamespace(id));
                 }
-                Ok(SceneBuilderRequest::ExternalEvent(evt)) => {
+                Some(SceneBuilderRequest::ExternalEvent(evt)) => {
                     self.send(SceneBuilderResult::ExternalEvent(evt));
                 }
-                Ok(SceneBuilderRequest::GetGlyphDimensions(request)) => {
+                Some(SceneBuilderRequest::GetGlyphDimensions(request)) => {
                     self.send(SceneBuilderResult::GetGlyphDimensions(request));
                 }
-                Ok(SceneBuilderRequest::GetGlyphIndices(request)) => {
+                Some(SceneBuilderRequest::GetGlyphIndices(request)) => {
                     self.send(SceneBuilderResult::GetGlyphIndices(request));
                 }
-                Ok(SceneBuilderRequest::StopRenderBackend) => {
+                Some(SceneBuilderRequest::StopRenderBackend) => {
                     self.send(SceneBuilderResult::StopRenderBackend);
                 }
-                Ok(SceneBuilderRequest::ShutDown(sync)) => {
+                Some(SceneBuilderRequest::ShutDown(sync)) => {
                     self.send(SceneBuilderResult::ShutDown(sync));
-                    break;
+                    return false;
                 }
-                Ok(SceneBuilderRequest::SimulateLongSceneBuild(time_ms)) => {
+                Some(SceneBuilderRequest::SimulateLongSceneBuild(time_ms)) => {
                     self.simulate_slow_ms = time_ms
                 }
-                Ok(SceneBuilderRequest::ReportMemory(mut report, tx)) => {
+                Some(SceneBuilderRequest::ReportMemory(mut report, tx)) => {
                     (*report) += self.report_memory();
                     tx.send(report).unwrap();
                 }
-                Ok(SceneBuilderRequest::SetFrameBuilderConfig(cfg)) => {
+                Some(SceneBuilderRequest::SetFrameBuilderConfig(cfg)) => {
                     self.config = cfg;
                 }
-                Ok(SceneBuilderRequest::SetParameter(prop)) => {
+                Some(SceneBuilderRequest::SetParameter(prop)) => {
                     self.send(SceneBuilderResult::SetParameter(prop));
                 }
                 #[cfg(feature = "replay")]
-                Ok(SceneBuilderRequest::LoadScenes(msg)) => {
+                Some(SceneBuilderRequest::LoadScenes(msg)) => {
                     self.load_scenes(msg);
                 }
                 #[cfg(feature = "capture")]
-                Ok(SceneBuilderRequest::SaveScene(config)) => {
+                Some(SceneBuilderRequest::SaveScene(config)) => {
                     self.save_scene(config);
                 }
                 #[cfg(feature = "capture")]
-                Ok(SceneBuilderRequest::StartCaptureSequence(config)) => {
+                Some(SceneBuilderRequest::StartCaptureSequence(config)) => {
                     self.start_capture_sequence(config);
                 }
                 #[cfg(feature = "capture")]
-                Ok(SceneBuilderRequest::StopCaptureSequence) => {
+                Some(SceneBuilderRequest::StopCaptureSequence) => {
                     // FIXME(aosmond): clear config for frames and resource cache without scene
                     // rebuild?
                     self.capture_config = None;
                     self.send(SceneBuilderResult::StopCaptureSequence);
                 }
-                Err(_) => {
-                    break;
+                None => {
+                    return false;
                 }
-            }
-
-            if let Some(ref hooks) = self.hooks {
-                hooks.poke();
-            }
-
-            tracy_end_frame!("scene_builder_thread");
         }
-
-        if let Some(ref hooks) = self.hooks {
-            hooks.deregister();
-        }
+        true
     }
 
     #[cfg(feature = "capture")]
@@ -830,26 +856,48 @@ pub struct LowPrioritySceneBuilderThread {
 impl LowPrioritySceneBuilderThread {
     pub fn run(&mut self) {
         loop {
-            match self.rx.recv() {
-                Ok(SceneBuilderRequest::Transactions(mut txns)) => {
-                    let txns : Vec<Box<TransactionMsg>> = txns.drain(..)
-                        .map(|txn| self.process_transaction(txn))
-                        .collect();
-                    self.tx.send(SceneBuilderRequest::Transactions(txns)).unwrap();
-                    self.tile_pool.cleanup();
-                }
-                Ok(SceneBuilderRequest::ShutDown(sync)) => {
-                    self.tx.send(SceneBuilderRequest::ShutDown(sync)).unwrap();
-                    break;
-                }
-                Ok(other) => {
-                    self.tx.send(other).unwrap();
-                }
-                Err(_) => {
-                    break;
-                }
+            if !self.handle_lp_msg(self.rx.recv().ok()) {
+                break;
             }
         }
+    }
+
+    // Single-threaded wasm: drain all pending low-priority requests non-blocking.
+    #[cfg(gecko_st)]
+    pub fn run_once(&mut self) -> bool {
+        loop {
+            match self.rx.try_recv() {
+                Ok(req) => {
+                    if !self.handle_lp_msg(Some(req)) {
+                        return false;
+                    }
+                }
+                Err(_) => return true,
+            }
+        }
+    }
+
+    fn handle_lp_msg(&mut self, msg: Option<SceneBuilderRequest>) -> bool {
+        match msg {
+            Some(SceneBuilderRequest::Transactions(mut txns)) => {
+                let txns : Vec<Box<TransactionMsg>> = txns.drain(..)
+                    .map(|txn| self.process_transaction(txn))
+                    .collect();
+                self.tx.send(SceneBuilderRequest::Transactions(txns)).unwrap();
+                self.tile_pool.cleanup();
+            }
+            Some(SceneBuilderRequest::ShutDown(sync)) => {
+                self.tx.send(SceneBuilderRequest::ShutDown(sync)).unwrap();
+                return false;
+            }
+            Some(other) => {
+                self.tx.send(other).unwrap();
+            }
+            None => {
+                return false;
+            }
+        }
+        true
     }
 
     fn process_transaction(&mut self, mut txn: Box<TransactionMsg>) -> Box<TransactionMsg> {

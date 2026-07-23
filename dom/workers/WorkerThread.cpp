@@ -76,6 +76,12 @@ WorkerThread::WorkerThread(ConstructorKey)
       mAcceptingNonWorkerRunnables(true)
 #endif
 {
+#if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
+  // Single-threaded wasm: this virtual thread runs its own JS (worker global +
+  // JSContext), so the ST scheduler must swap js::TlsContext to it while it is
+  // impersonated. See nsThreadManager::STAutoImpersonate.
+  STMarkJSThread();
+#endif
 }
 
 WorkerThread::~WorkerThread() {

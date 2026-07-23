@@ -9,6 +9,7 @@ use std::ops::{Deref, DerefMut, Range};
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicI8, AtomicPtr, AtomicU32, AtomicU8, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+#[cfg(not(gecko_st))]
 use std::thread;
 use crate::{
     api::units::*, api::ColorDepth, api::ColorF, api::ExternalImageId, api::ImageRendering, api::YuvRangedColorSpace,
@@ -920,27 +921,35 @@ impl SwCompositeThread {
             shutting_down: AtomicBool::new(false),
         });
         let result = info.clone();
-        let thread_name = "SwComposite";
-        thread::Builder::new()
-            .name(thread_name.into())
-            // The composite thread only calls into SWGL to composite, and we
-            // have potentially many composite threads for different windows,
-            // so using the default stack size is excessive. A reasonably small
-            // stack size should be more than enough for SWGL and reduce memory
-            // overhead.
-            // Bug 1731569 - Need at least 36K to avoid problems with ASAN.
-            .stack_size(40 * 1024)
-            .spawn(move || {
-                profiler::register_thread(thread_name);
-                // Process any available jobs. This will return a non-Ok
-                // result when the job queue is dropped, causing the thread
-                // to eventually exit.
-                while let Some((job, band)) = info.take_job(true) {
-                    info.process_job(job, band, true);
-                }
-                profiler::unregister_thread();
-            })
-            .expect("Failed creating SwComposite thread");
+        #[cfg(not(gecko_st))]
+        {
+            let thread_name = "SwComposite";
+            thread::Builder::new()
+                .name(thread_name.into())
+                // The composite thread only calls into SWGL to composite, and we
+                // have potentially many composite threads for different windows,
+                // so using the default stack size is excessive. A reasonably small
+                // stack size should be more than enough for SWGL and reduce memory
+                // overhead.
+                // Bug 1731569 - Need at least 36K to avoid problems with ASAN.
+                .stack_size(40 * 1024)
+                .spawn(move || {
+                    profiler::register_thread(thread_name);
+                    // Process any available jobs. This will return a non-Ok
+                    // result when the job queue is dropped, causing the thread
+                    // to eventually exit.
+                    while let Some((job, band)) = info.take_job(true) {
+                        info.process_job(job, band, true);
+                    }
+                    profiler::unregister_thread();
+                })
+                .expect("Failed creating SwComposite thread");
+        }
+        // Single-threaded wasm build: no OS threads are available, so there is
+        // no SwComposite thread. Queued jobs are instead drained and processed
+        // inline in wait_for_composites (see the gecko_st path there).
+        #[cfg(gecko_st)]
+        let _ = info;
         result
     }
 
@@ -1049,6 +1058,7 @@ impl SwCompositeThread {
 
     /// Take a job from the queue. Optionally block waiting for jobs to become
     /// available if this is called from the SwComposite thread.
+    #[cfg_attr(gecko_st, allow(dead_code))]
     fn take_job(&self, wait: bool) -> Option<(&mut SwCompositeGraphNode, i32)> {
         // First try checking the cached job outside the scope of the mutex.
         // For jobs that have multiple bands, this allows us to avoid having
@@ -1117,27 +1127,54 @@ impl SwCompositeThread {
     /// they were queued without having to rely upon possibly unavailable
     /// graph dependencies.
     fn wait_for_composites(&self, sync: bool) {
-        // If processing asynchronously, try to steal jobs from the composite
-        // thread if it is busy.
-        if !sync {
-            while let Some((job, band)) = self.take_job(false) {
-                self.process_job(job, band, false);
+        // Single-threaded wasm build: there is no SwComposite thread. Drain and
+        // process every ready job inline. process_job -> unblock_children ->
+        // send_job enqueues newly-unblocked dependents as their dependencies
+        // complete, so looping until the queue (and cached job) are empty walks
+        // the whole composite dependency graph in order on this thread.
+        #[cfg(gecko_st)]
+        {
+            let _ = sync;
+            loop {
+                // Finish any remaining bands of the cached current job first.
+                if let Some((job, band)) = self.try_take_job() {
+                    self.process_job(job, band, false);
+                    continue;
+                }
+                // Otherwise install the next queued job as current, if any.
+                let next = self.lock().pop_front();
+                match next {
+                    Some(job) => self.current_job.store(job.get_ptr_mut(), Ordering::SeqCst),
+                    None => break,
+                }
             }
-            // Once there are no more jobs, just fall through to waiting
-            // synchronously for the composite thread to finish processing.
+            self.jobs_completed.store(true, Ordering::SeqCst);
+            return;
         }
-        // If processing synchronously, just wait for the composite thread
-        // to complete processing any in-flight jobs, then bail.
-        let mut jobs = self.lock();
-        // Signal that the main thread may wait for job completion so that the
-        // SwComposite thread can wake it up if necessary.
-        self.waiting_for_jobs.store(true, Ordering::SeqCst);
-        // Wait for job completion to ensure there are no more in-flight jobs.
-        while !self.jobs_completed.load(Ordering::SeqCst) {
-            jobs = self.jobs_available.wait(jobs).unwrap();
+        #[cfg(not(gecko_st))]
+        {
+            // If processing asynchronously, try to steal jobs from the composite
+            // thread if it is busy.
+            if !sync {
+                while let Some((job, band)) = self.take_job(false) {
+                    self.process_job(job, band, false);
+                }
+                // Once there are no more jobs, just fall through to waiting
+                // synchronously for the composite thread to finish processing.
+            }
+            // If processing synchronously, just wait for the composite thread
+            // to complete processing any in-flight jobs, then bail.
+            let mut jobs = self.lock();
+            // Signal that the main thread may wait for job completion so that the
+            // SwComposite thread can wake it up if necessary.
+            self.waiting_for_jobs.store(true, Ordering::SeqCst);
+            // Wait for job completion to ensure there are no more in-flight jobs.
+            while !self.jobs_completed.load(Ordering::SeqCst) {
+                jobs = self.jobs_available.wait(jobs).unwrap();
+            }
+            // Done waiting for job completion.
+            self.waiting_for_jobs.store(false, Ordering::SeqCst);
         }
-        // Done waiting for job completion.
-        self.waiting_for_jobs.store(false, Ordering::SeqCst);
     }
 }
 

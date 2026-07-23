@@ -2075,16 +2075,12 @@ export const XPIDatabase = {
     logger.debug(`Starting async load of XPI database ${this.jsonFilePath}`);
     this._dbPromise = (async () => {
       try {
-        console.error("[XPIDB-DIAG] asyncLoadDB IIFE start, reading " + this.jsonFilePath);
         let json = await IOUtils.readJSON(this.jsonFilePath);
-        console.error("[XPIDB-DIAG] readJSON resolved");
 
         logger.debug("Finished async read of XPI database, parsing...");
         await this.maybeIdleDispatch();
         await this.parseDB(json, true);
-        console.error("[XPIDB-DIAG] parseDB done");
       } catch (error) {
-        console.error("[XPIDB-DIAG] caught: " + error.name + " -> rebuild");
         if (DOMException.isInstance(error) && error.name === "NotFoundError") {
           if (Services.prefs.getIntPref(PREF_DB_SCHEMA, 0)) {
             this._recordStartupError("dbMissing");
@@ -2100,9 +2096,7 @@ export const XPIDatabase = {
           "XPIDB_rebuildUnreadableDB_MS",
           aRebuildOnError
         );
-        console.error("[XPIDB-DIAG] rebuild done");
       }
-      console.error("[XPIDB-DIAG] asyncLoadDB RESOLVING");
       return this.addonDB;
     })();
 

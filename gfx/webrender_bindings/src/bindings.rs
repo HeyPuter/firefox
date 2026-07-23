@@ -208,7 +208,33 @@ impl DocumentHandle {
         if let Some(ref ht) = self.hit_tester {
             return ht;
         }
-        self.hit_tester = Some(self.hit_tester_request.take().unwrap().resolve());
+        #[cfg(not(gecko_st))]
+        {
+            self.hit_tester = Some(self.hit_tester_request.take().unwrap().resolve());
+        }
+        // Single-threaded wasm: resolve() does a blocking rx.recv() waiting for the
+        // render backend to reply, but under ST the backend only advances when
+        // wr_st_pump steps it -- a blocking recv would deadlock. Step the ST
+        // WebRender pipeline until the hit-tester reply arrives.
+        #[cfg(gecko_st)]
+        {
+            extern "C" {
+                fn wr_st_pump() -> bool;
+            }
+            let req = self.hit_tester_request.take().unwrap();
+            let mut spins: u64 = 0;
+            loop {
+                if let Ok(ht) = req.rx.try_recv() {
+                    self.hit_tester = Some(ht);
+                    break;
+                }
+                unsafe { wr_st_pump(); }
+                spins += 1;
+                if spins % 100000 == 0 {
+                    eprintln!("[WR-ST-DIAG] ensure_hit_tester: pumped {} times, still waiting", spins);
+                }
+            }
+        }
         self.hit_tester.as_ref().unwrap()
     }
 }
@@ -1155,6 +1181,15 @@ pub extern "C" fn wr_thread_pool_new(low_priority: bool) -> *mut WrThreadPool {
     // With build-std (+atomics) Rust threads work on emscripten, so spawn the
     // real worker pool like every other platform.
     let builder = builder.num_threads(num_threads);
+
+    // Single-threaded wasm (no pthreads): rayon cannot spawn worker threads, so
+    // build a pool with a no-op spawn handler that never actually runs workers.
+    // WebRender is configured to run all worker jobs inline under gecko_st
+    // (enable_multithreading=false + inlined workers.spawn/par_iter), so this
+    // pool is never used -- it exists only to satisfy the API without panicking.
+    #[cfg(gecko_st)]
+    let builder = builder.spawn_handler(|_thread| Ok(()));
+
     let worker = builder.build();
 
     let workers = Arc::new(worker.unwrap());
@@ -2113,6 +2148,9 @@ pub extern "C" fn wr_window_new(
     let opts = WebRenderOptions {
         enable_aa: true,
         enable_subpixel_aa,
+        // Single-threaded wasm: no rayon workers -> glyphs rasterize inline.
+        #[cfg(gecko_st)]
+        enable_multithreading: false,
         support_low_priority_transactions,
         allow_texture_swizzling,
         blob_image_handler: Some(Box::new(Moz2dBlobImageHandler::new(

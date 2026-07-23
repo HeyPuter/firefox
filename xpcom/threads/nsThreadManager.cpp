@@ -311,6 +311,30 @@ struct STSchedState {
 static STSchedState* sSTState = nullptr;
 static nsThread* sSTOverride = nullptr;
 
+// SpiderMonkey "current JSContext" (js::TlsContext) accessors, defined in
+// js/src/vm/JSContext.cpp. The one real thread's TlsContext slot is shared by
+// all virtual threads, so we swap it when impersonating a different one (a
+// worker runs its own JSContext; the main thread its own).
+extern "C" void* gecko_st_get_tlscx();
+extern "C" void gecko_st_set_tlscx(void* aCx);
+// Cycle-collector per-thread data (CollectorData*), defined in
+// nsCycleCollector.cpp. Swapped per virtual thread for the same reason as
+// js::TlsContext -- each DOM worker has its own cycle collector.
+extern "C" void* gecko_st_get_ccdata();
+extern "C" void gecko_st_set_ccdata(void* aData);
+static void* sSTMainCCData = nullptr;
+// GC context (js::TlsGCContext), defined in js/src/gc/GC.cpp. Also per-real-
+// thread TLS that main + worker runtimes clobber; swapped per virtual thread.
+extern "C" void* gecko_st_get_gccx();
+extern "C" void gecko_st_set_gccx(void* aCx);
+static void* sSTMainGCCx = nullptr;
+
+// The main thread's JSContext, captured the first time we impersonate away
+// from the main thread (it is created during startup before any impersonation,
+// so at that moment TlsContext holds it). Used to restore the main context
+// when draining main-thread events nested inside a worker impersonation.
+static void* sSTMainCx = nullptr;
+
 STSchedState& STState() {
   if (!sSTState) {
     sSTState = new STSchedState();
@@ -387,10 +411,6 @@ bool nsThreadManager::STPump() {
   }
   STSchedState& st = *sSTState;
   if (st.mDepth >= 64) {
-    static uint64_t sCapHits = 0;
-    if ((sCapHits++ % 1000000ULL) == 0) {
-      printf("STPump[DIAG]: depth cap hit (depth=%u)\n", st.mDepth);
-    }
     return false;
   }
   st.mDepth++;
@@ -401,35 +421,46 @@ bool nsThreadManager::STPump() {
   }
   // Copy: threads can register/unregister while being pumped.
   nsTArray<RefPtr<nsThread>> threads = st.mThreads.Clone();
-  static uint64_t sDiagCounter = 0;
-  bool diag = (++sDiagCounter % 2000000ULL) == 1;
   for (auto& thread : threads) {
-    bool one = thread->STPumpOne();
-    if (diag && one) {
-      nsAutoCString nm;
-      thread->GetThreadName(nm);
-      printf("STPump[DIAG]: ran work on vthread '%s'\n", nm.get());
-    }
-    did |= one;
+    did |= thread->STPumpOne();
   }
-  if (diag) {
-    nsAutoCString names;
-    for (auto& t : threads) {
-      nsAutoCString nm;
-      t->GetThreadName(nm);
-      names.Append(nm);
-      names.Append(' ');
-    }
-    printf("STPump[DIAG]: %zu vthreads: %s\n", threads.Length(), names.get());
-  }
-  if (!did) {
-    // Nothing else moved: the wait we were called from can only be satisfied
-    // by a MAIN-thread event (e.g. a queued in-process IPC dispatch). Drain a
-    // bounded batch, nested-event-loop style, matching what Gecko's blocking
-    // main-thread waits (SpinEventLoopUntil, sync IPC) already permit.
+  // Drain a bounded batch of MAIN-thread events when either (a) no vthread made
+  // progress -- the wait can then only be satisfied by a main-thread event, or
+  // (b) we're NESTED inside another pump (st.mDepth > 1), i.e. some blocking
+  // wait is on the stack whose completion may depend on main-thread work (e.g.
+  // a worker's sync-loop script load waiting on the main-thread fetch). At the
+  // top level a busy vthread must not starve this, but the top-level tick drains
+  // main itself, so gating on !did there is fine.
+  if (!did || st.mDepth > 1) {
+    // Nested-event-loop style, matching what Gecko's blocking main-thread waits
+    // (SpinEventLoopUntil, sync IPC) already permit.
     nsThread* main = nsThreadManager::get().mMainThread;
     if (main && !main->mSTPumping) {
       main->mSTPumping = true;
+      // We may be nested inside a virtual-thread impersonation (e.g. a worker's
+      // sync-loop wait). main->ProcessNextEvent must run AS the main thread, so
+      // temporarily restore full main-thread identity: XPCOM override, NSPR
+      // current thread, NS_IsMainThread, plus the JS context + cycle-collector
+      // data (which are per-real-thread and currently hold the impersonated
+      // thread's values).
+      nsThread* savedOverride = sSTOverride;
+      PRThread* savedPR = PR_STSwapCurrentThread(main->GetPRThread());
+      bool savedIsMain = sTLSIsMainThread.get();
+      void* prevCx = gecko_st_get_tlscx();
+      void* prevCCData = gecko_st_get_ccdata();
+      void* prevGCCx = gecko_st_get_gccx();
+      sSTOverride = nullptr;
+      sTLSIsMainThread.set(true);
+      if (sSTMainCx) {
+        gecko_st_set_tlscx(sSTMainCx);
+      }
+      if (sSTMainCCData) {
+        gecko_st_set_ccdata(sSTMainCCData);
+      }
+      if (sSTMainGCCx) {
+        gecko_st_set_gccx(sSTMainGCCx);
+      }
+      int drained = 0;
       for (int i = 0; i < 32; i++) {
         bool processed = false;
         if (NS_FAILED(main->ProcessNextEvent(false, &processed)) ||
@@ -437,7 +468,14 @@ bool nsThreadManager::STPump() {
           break;
         }
         did = true;
+        drained++;
       }
+      gecko_st_set_tlscx(prevCx);
+      gecko_st_set_ccdata(prevCCData);
+      gecko_st_set_gccx(prevGCCx);
+      sTLSIsMainThread.set(savedIsMain);
+      PR_STSwapCurrentThread(savedPR);
+      sSTOverride = savedOverride;
       main->mSTPumping = false;
     }
   }
@@ -446,14 +484,49 @@ bool nsThreadManager::STPump() {
 }
 
 mozilla::STAutoImpersonate::STAutoImpersonate(nsThread* aThread) {
+  mThread = aThread;
   mPrevOverride = sSTOverride;
+  // Lazily capture the main thread's JSContext the first time we impersonate
+  // away from it.
+  if (!mPrevOverride) {
+    sSTMainCx = gecko_st_get_tlscx();
+    sSTMainCCData = gecko_st_get_ccdata();
+    sSTMainGCCx = gecko_st_get_gccx();
+  }
   sSTOverride = aThread;
   mPrevPR = PR_STSwapCurrentThread(aThread->GetPRThread());
   mPrevIsMain = sTLSIsMainThread.get();
   sTLSIsMainThread.set(false);
+  // Swap SpiderMonkey's current context to this virtual thread's context, but
+  // ONLY for JS-running threads (DOM workers). Non-JS vthreads never touch JS
+  // and are left exactly as before. For a worker that hasn't created its
+  // context yet, the stored context is null, which lets its JS_NewContext
+  // succeed (that asserts TlsContext is empty).
+  mPrevCx = nullptr;
+  mPrevCCData = nullptr;
+  mPrevGCCx = nullptr;
+  if (aThread->STIsJSThread()) {
+    mPrevCx = gecko_st_get_tlscx();
+    gecko_st_set_tlscx(aThread->STGetJSContext());
+    mPrevCCData = gecko_st_get_ccdata();
+    gecko_st_set_ccdata(aThread->STGetCCData());
+    mPrevGCCx = gecko_st_get_gccx();
+    gecko_st_set_gccx(aThread->STGetGCContext());
+  }
 }
 
 mozilla::STAutoImpersonate::~STAutoImpersonate() {
+  // Capture whatever context this virtual thread now owns (a worker may have
+  // just created one) so the next impersonation restores it, then restore the
+  // context that was current before we impersonated.
+  if (mThread->STIsJSThread()) {
+    mThread->STSetJSContext(gecko_st_get_tlscx());
+    gecko_st_set_tlscx(mPrevCx);
+    mThread->STSetCCData(gecko_st_get_ccdata());
+    gecko_st_set_ccdata(mPrevCCData);
+    mThread->STSetGCContext(gecko_st_get_gccx());
+    gecko_st_set_gccx(mPrevGCCx);
+  }
   sTLSIsMainThread.set(mPrevIsMain);
   PR_STSwapCurrentThread(mPrevPR);
   sSTOverride = mPrevOverride;

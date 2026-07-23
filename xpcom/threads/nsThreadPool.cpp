@@ -165,11 +165,9 @@ nsresult nsThreadPool::PutEvent(already_AddRefed<nsIRunnable> aEvent,
       if (NS_WARN_IF(NS_FAILED(rv))) {
         return rv;
       }
-      printf("[nsThreadPool-DIAG] ST pool '%s' created vthread\n", mName.get());
       mThreads.AppendObject(thread);
     }
     LogRunnable::LogDispatch(event);
-    printf("[nsThreadPool-DIAG] ST dispatch to pool '%s'\n", mName.get());
     return thread->Dispatch(event.forget(), NS_DISPATCH_NORMAL);
   }
 #endif

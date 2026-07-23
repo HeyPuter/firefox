@@ -82,6 +82,12 @@ CompositorVsyncScheduler::CompositorVsyncScheduler(
   mAsapScheduling =
       StaticPrefs::layers_offmainthreadcomposition_frame_rate() == 0 ||
       gfxPlatform::IsInLayoutAsapMode();
+#if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
+  // Single-threaded wasm: there is no vsync thread to drive ScheduleComposition
+  // through ObserveVsync, so force ASAP scheduling -- every composite request
+  // posts a Composite task directly onto the (pumped) compositor thread queue.
+  mAsapScheduling = true;
+#endif
 }
 
 CompositorVsyncScheduler::~CompositorVsyncScheduler() {

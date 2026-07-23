@@ -296,6 +296,40 @@ class nsThread : public nsIThreadInternal,
   // Reentrancy guard: STPump must not re-drain a virtual thread that is
   // already mid-event (its nested waits pump the OTHER threads instead).
   bool mSTPumping = false;
+  // Per-virtual-thread SpiderMonkey "current context". All virtual threads
+  // share the one real thread's js::TlsContext slot, so STAutoImpersonate
+  // saves/restores it here when switching which virtual thread is running.
+  // A worker's JSContext is created lazily on first run, so this starts null
+  // and is captured on impersonation exit.
+  void* mSTJSContext = nullptr;
+  // Per-virtual-thread cycle-collector data (CollectorData*), swapped alongside
+  // mSTJSContext for the same reason (sCollectorData is per-real-thread TLS).
+  void* mSTCCData = nullptr;
+  // Per-virtual-thread GC context (js::TlsGCContext), swapped alongside
+  // mSTJSContext/mSTCCData (also per-real-thread TLS, set per-runtime-init).
+  void* mSTGCContext = nullptr;
+  // True for virtual threads that run their own JS (DOM workers). Only these
+  // get their js::TlsContext swapped on impersonation; all other vthreads
+  // (socket, timer, DNS, ...) never touch JS and are left untouched, matching
+  // the pre-worker behavior exactly.
+  bool mSTIsJSThread = false;
+  // True once a DOM worker vthread is driven by its own scheduler pump hook
+  // (WorkerThreadPrimaryRunnable::STPumpHook). STPumpOne then skips it so its
+  // events aren't drained twice (the hook runs them via DoRunLoopStepST).
+  bool mSTHookDriven = false;
+
+ public:
+  void STMarkJSThread() { mSTIsJSThread = true; }
+  void STMarkHookDriven() { mSTHookDriven = true; }
+  bool STIsJSThread() const { return mSTIsJSThread; }
+  void* STGetJSContext() const { return mSTJSContext; }
+  void STSetJSContext(void* aCx) { mSTJSContext = aCx; }
+  void* STGetCCData() const { return mSTCCData; }
+  void STSetCCData(void* aData) { mSTCCData = aData; }
+  void* STGetGCContext() const { return mSTGCContext; }
+  void STSetGCContext(void* aCx) { mSTGCContext = aCx; }
+
+ protected:
 #endif
 
   mozilla::Atomic<bool> mShutdownRequired;

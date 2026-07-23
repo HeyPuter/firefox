@@ -318,6 +318,18 @@ static_assert(std::size(slotsToAllocKindBytes) == std::size(slotsToThingKind));
 
 MOZ_THREAD_LOCAL(JS::GCContext*) js::TlsGCContext;
 
+#if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
+// Single-threaded wasm: TlsGCContext is per-REAL-thread TLS set at each
+// runtime's init (to that runtime's main-thread GC context) and cleared at its
+// finish. With main + worker runtimes sharing one real thread, the worker's
+// init/finish clobbers main's value (finish sets it null), crashing the next
+// main GC. The ST scheduler swaps it per virtual thread, like js::TlsContext.
+extern "C" void* gecko_st_get_gccx() { return js::TlsGCContext.get(); }
+extern "C" void gecko_st_set_gccx(void* aCx) {
+  js::TlsGCContext.set(reinterpret_cast<JS::GCContext*>(aCx));
+}
+#endif
+
 JS::GCContext::GCContext(js::gc::GCRuntime* gc) : gc_(gc) {}
 
 JSRuntime* JS::GCContext::runtime() const {

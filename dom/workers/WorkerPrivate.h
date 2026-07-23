@@ -65,6 +65,7 @@ namespace mozilla {
 class ThrottledEventQueue;
 namespace dom {
 
+class AutoJSAPI;
 class PRemoteWorkerDebuggerChild;
 class PRemoteWorkerDebuggerParent;
 class RemoteWorkerChild;
@@ -396,6 +397,19 @@ class WorkerPrivate final
 
   MOZ_CAN_RUN_SCRIPT
   void DoRunLoop(JSContext* aCx);
+
+#if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
+  // Single-threaded wasm: DoRunLoop's blocking for(;;) would never let the
+  // wasm main loop return to the browser. Instead DoRunLoop() only does the
+  // one-time setup and returns; the worker's primary runnable then registers a
+  // scheduler pump hook that calls DoRunLoopStepST() once per pump -- one
+  // non-blocking iteration of the original loop body, returning true when the
+  // worker has transitioned to Dead (loop-portion teardown already done).
+  // Returns true once the worker has reached Dead. *aDidWork is set to whether
+  // this step actually made progress (so the scheduler pump can tell idle from
+  // busy and settle blocking waits correctly).
+  MOZ_CAN_RUN_SCRIPT bool DoRunLoopStepST(bool* aDidWork);
+#endif
 
   void UnrootGlobalScopes();
 
@@ -1752,6 +1766,20 @@ class WorkerPrivate final
 
   // A set of active JS async tasks that should prevent idle shutdown.
   HashMap<JS::Dispatchable*, RefPtr<StrongWorkerRef>> mPendingJSAsyncTasks;
+
+#if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
+  // Persistent state for the cooperative (non-blocking) run loop; see
+  // DoRunLoop/DoRunLoopStepST. These outlive individual pump iterations.
+  mozilla::UniquePtr<mozilla::dom::AutoJSAPI> mSTJsapi;
+  bool mSTCheckFinalGCCC = false;
+  // Re-entrancy guard: a worker's nested sync loop (e.g. script load) pumps the
+  // scheduler via WaitForWorkerEvents, which re-fires this worker's pump hook.
+  // The hook must not re-enter DoRunLoopStepST while a step (or nested sync
+  // loop) is already on the stack -- the nested pump should only advance OTHER
+  // vthreads + the main thread, letting the in-progress sync loop pick up its
+  // own completion.
+  bool mSTInStep = false;
+#endif
 
   TargetShutdownTaskSet mShutdownTasks MOZ_GUARDED_BY(mMutex);
   bool mShutdownTasksRun MOZ_GUARDED_BY(mMutex) = false;

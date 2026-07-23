@@ -1468,8 +1468,13 @@ impl AsyncForEach<FontContext> for Arc<FontContexts> {
 
         // Arc that can be safely moved into a spawn closure.
         let font_contexts = self.clone();
-        // Spawn a new thread on which to run the for-each off the main thread.
-        self.workers.spawn(move || {
+        // Single-threaded wasm: no rayon workers. Run the body inline; it signals
+        // `locked_cond` which the caller then waits on (already satisfied).
+        #[cfg(gecko_st)]
+        let spawn = |f: Box<dyn FnOnce() + Send>| f();
+        #[cfg(not(gecko_st))]
+        let spawn = |f: Box<dyn FnOnce() + Send>| self.workers.spawn(f);
+        spawn(Box::new(move || {
             // Lock the shared and worker contexts up front.
             let mut locks = Vec::with_capacity(font_contexts.num_worker_contexts());
             for i in 0 .. font_contexts.num_worker_contexts() {
@@ -1484,7 +1489,7 @@ impl AsyncForEach<FontContext> for Arc<FontContexts> {
             for context in locks {
                 f(context);
             }
-        });
+        }));
 
         // Wait for locked condition before resuming. Safe to proceed thereafter
         // since any other thread that needs to use a FontContext will try to lock

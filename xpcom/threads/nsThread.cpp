@@ -464,6 +464,10 @@ bool nsThread::STPumpOne() {
   if (mSTPumping) {
     return false;
   }
+  if (mSTHookDriven) {
+    // A DOM worker driven by its own cooperative pump hook; do not auto-drain.
+    return false;
+  }
   mSTPumping = true;
   bool did = false;
   uint32_t drained = 0;
@@ -476,6 +480,13 @@ bool nsThread::STPumpOne() {
       break;
     }
     did = true;
+    if (mSTHookDriven) {
+      // The event we just ran was a DOM worker's primary runnable, which took
+      // over cooperative stepping via its own pump hook. Stop draining now so
+      // the worker's remaining (e.g. script-compile) runnables are processed
+      // through its run-loop machinery, not raw here.
+      break;
+    }
     if (++drained >= 10000) {
       // A queue that never runs dry inside one pump means an event is
       // re-dispatching itself; yield to the outer loop instead of wedging.

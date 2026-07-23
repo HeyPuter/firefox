@@ -144,11 +144,13 @@ void RenderThread::Start(uint32_t aNamespace) {
   stackSize = std::max(stackSize, 4 * 1024 * 1024U);
 #endif
 
-#if defined(__EMSCRIPTEN__)
+#if defined(__EMSCRIPTEN__) && defined(__EMSCRIPTEN_PTHREADS__)
   // gecko-wasm GPU mode: hand the page canvas (#screen) to the Renderer thread as a
   // transferred OffscreenCanvas so GLContextProviderEmscripten creates its compositor
   // context LOCAL on that worker (PROXY_FALLBACK finds it) instead of proxying every
   // GL call to the main thread. Consumed by the very next pthread we create below.
+  // Single-threaded build: the Renderer is a virtual thread that runs on the main
+  // thread, where #screen already lives -- no OffscreenCanvas transfer needed.
   if (getenv("GECKO_GPU")) {
     PR_SetTransferredCanvasForNextThread("#screen");
   }

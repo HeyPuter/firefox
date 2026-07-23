@@ -300,6 +300,54 @@ impl Default for WebRenderOptions {
 /// let (renderer, sender) = Renderer::new(opts);
 /// ```
 /// [WebRenderOptions]: struct.WebRenderOptions.html
+
+// ------- Single-threaded wasm (gecko_st) cooperative WebRender driver --------
+// With no pthreads, WebRender cannot spawn its RenderBackend / SceneBuilder /
+// LowPrioritySceneBuilder threads. Under gecko_st they are constructed inline
+// and stashed here; `wr_st_pump` steps them cooperatively (called from the
+// gecko single-threaded scheduler). The Renderer (GL) still runs on the
+// virtualized "Renderer" nsThread via the normal RendererProxy path.
+#[cfg(gecko_st)]
+mod st_driver {
+    use crate::render_backend::RenderBackend;
+    use crate::scene_builder_thread::{SceneBuilderThread, LowPrioritySceneBuilderThread};
+    use std::cell::RefCell;
+
+    #[derive(Default)]
+    pub struct StWr {
+        pub scene_builder: Option<SceneBuilderThread>,
+        pub lp_scene_builder: Option<LowPrioritySceneBuilderThread>,
+        pub backend: Option<RenderBackend>,
+        pub frame_counter: u32,
+    }
+
+    thread_local! {
+        pub static ST_WR: RefCell<StWr> = RefCell::new(StWr::default());
+    }
+}
+
+// Step the cooperative WebRender pipeline: low-priority scene builder ->
+// scene builder -> render backend. Safe to call frequently; each call drains
+// whatever is currently queued and returns.
+#[cfg(gecko_st)]
+#[no_mangle]
+pub extern "C" fn wr_st_pump() -> bool {
+    st_driver::ST_WR.with(|cell| {
+        let mut s = cell.borrow_mut();
+        if let Some(lp) = s.lp_scene_builder.as_mut() {
+            lp.run_once();
+        }
+        if let Some(sb) = s.scene_builder.as_mut() {
+            sb.run_once();
+        }
+        let st_driver::StWr { backend, frame_counter, .. } = &mut *s;
+        if let Some(be) = backend.as_mut() {
+            be.run_once(frame_counter);
+        }
+    });
+    true
+}
+
 pub fn create_webrender_instance(
     gl: Rc<dyn gl::Gl>,
     notifier: Box<dyn RenderNotifier>,
@@ -317,6 +365,9 @@ pub fn create_webrender_instance(
             }
         }
 
+        // Single-threaded wasm: skip profiler thread registration (diagnostic
+        // only, and it hangs under the no-pthread cooperative scheduler).
+        #[cfg(not(gecko_st))]
         register_thread_with_profiler("Compositor".to_owned());
     }
 
@@ -596,8 +647,11 @@ pub fn create_webrender_instance(
 
     let blob_image_handler = options.blob_image_handler.take();
     let scene_builder_hooks = options.scene_builder_hooks;
+    #[cfg_attr(gecko_st, allow(unused_variables))]
     let rb_thread_name = format!("WRRenderBackend#{}", options.renderer_id.unwrap_or(0));
+    #[cfg_attr(gecko_st, allow(unused_variables))]
     let scene_thread_name = format!("WRSceneBuilder#{}", options.renderer_id.unwrap_or(0));
+    #[cfg_attr(gecko_st, allow(unused_variables))]
     let lp_scene_thread_name = format!("WRSceneBuilderLP#{}", options.renderer_id.unwrap_or(0));
 
     let glyph_rasterizer = GlyphRasterizer::new(
@@ -611,6 +665,7 @@ pub fn create_webrender_instance(
 
     let sb_fonts = fonts.clone();
 
+    #[cfg(not(gecko_st))]
     thread::Builder::new().name(scene_thread_name.clone()).spawn(move || {
         register_thread_with_profiler(scene_thread_name.clone());
         profiler::register_thread(&scene_thread_name);
@@ -626,6 +681,18 @@ pub fn create_webrender_instance(
 
         profiler::unregister_thread();
     })?;
+    // Single-threaded wasm: construct inline and stash for cooperative stepping.
+    #[cfg(gecko_st)]
+    {
+        let scene_builder = SceneBuilderThread::new(
+            config,
+            sb_fonts,
+            make_size_of_ops(),
+            scene_builder_hooks,
+            scene_builder_channels,
+        );
+        st_driver::ST_WR.with(|c| c.borrow_mut().scene_builder = Some(scene_builder));
+    }
 
     let low_priority_scene_tx = if options.support_low_priority_transactions {
         let (low_priority_scene_tx, low_priority_scene_rx) = unbounded_channel();
@@ -635,6 +702,7 @@ pub fn create_webrender_instance(
             tile_pool: api::BlobTilePool::new(),
         };
 
+        #[cfg(not(gecko_st))]
         thread::Builder::new().name(lp_scene_thread_name.clone()).spawn(move || {
             register_thread_with_profiler(lp_scene_thread_name.clone());
             profiler::register_thread(&lp_scene_thread_name);
@@ -644,6 +712,8 @@ pub fn create_webrender_instance(
 
             profiler::unregister_thread();
         })?;
+        #[cfg(gecko_st)]
+        st_driver::ST_WR.with(|c| c.borrow_mut().lp_scene_builder = Some(lp_builder));
 
         low_priority_scene_tx
     } else {
@@ -675,6 +745,7 @@ pub fn create_webrender_instance(
     let rb_scene_tx = scene_tx.clone();
     let rb_fonts = fonts.clone();
     let enable_multithreading = options.enable_multithreading;
+    #[cfg(not(gecko_st))]
     thread::Builder::new().name(rb_thread_name.clone()).spawn(move || {
         if let Some(hooks) = render_backend_hooks {
             hooks.init_thread();
@@ -724,6 +795,49 @@ pub fn create_webrender_instance(
         backend.run();
         profiler::unregister_thread();
     })?;
+    // Single-threaded wasm: construct the render backend inline and stash it for
+    // cooperative stepping via wr_st_pump (no dedicated RenderBackend thread).
+    #[cfg(gecko_st)]
+    {
+        if let Some(hooks) = render_backend_hooks {
+            hooks.init_thread();
+        }
+        let texture_cache = TextureCache::new(
+            max_internal_texture_size,
+            image_tiling_threshold,
+            color_cache_formats,
+            swizzle_settings,
+            &texture_cache_config,
+        );
+        let picture_textures = PictureTextures::new(
+            picture_tile_size,
+            picture_texture_filter,
+        );
+        let glyph_cache = GlyphCache::new();
+        let mut resource_cache = ResourceCache::new(
+            texture_cache,
+            picture_textures,
+            glyph_rasterizer,
+            glyph_cache,
+            rb_fonts,
+            rb_blob_handler,
+        );
+        resource_cache.enable_multithreading(enable_multithreading);
+        let backend = RenderBackend::new(
+            api_rx,
+            result_tx,
+            rb_scene_tx,
+            resource_cache,
+            chunk_pool,
+            backend_notifier,
+            config,
+            sampler,
+            make_size_of_ops(),
+            debug_flags,
+            namespace_alloc_by_client,
+        );
+        st_driver::ST_WR.with(|c| c.borrow_mut().backend = Some(backend));
+    }
 
     let debug_method = if !options.enable_gpu_markers {
         // The GPU markers are disabled.

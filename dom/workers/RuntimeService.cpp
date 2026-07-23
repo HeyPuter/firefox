@@ -67,6 +67,9 @@
 #include "nsPIDOMWindow.h"
 #include "nsServiceManagerUtils.h"
 #include "nsThreadUtils.h"
+#if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
+#  include "nsThreadManager.h"  // STAutoImpersonate, STAddPumpHook (ST workers)
+#endif
 #include "nsXPCOM.h"
 #include "nsXPCOMPrivate.h"
 #include "xpcpublic.h"
@@ -1099,6 +1102,21 @@ class WorkerThreadPrimaryRunnable final : public Runnable {
   }
 
   NS_INLINE_DECL_REFCOUNTING_INHERITED(WorkerThreadPrimaryRunnable, Runnable)
+
+#if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
+ public:
+  // Single-threaded wasm cooperative worker run. Run() does the one-time
+  // worker-thread setup (context creation etc.) then registers STPumpHook,
+  // which steps WorkerPrivate::DoRunLoopStepST() once per scheduler pump and,
+  // when the worker reaches Dead, runs STFinish() (the teardown that the
+  // blocking build does after DoRunLoop returns).
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY nsresult STStartRun();
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY static bool STPumpHook(void* aClosure);
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY void STFinish();
+
+ private:
+  UniquePtr<WorkerJSContext> mSTContext;
+#endif
 
  private:
   ~WorkerThreadPrimaryRunnable() = default;
@@ -2251,6 +2269,9 @@ WorkerThreadPrimaryRunnable::Run() {
   AUTO_PROFILER_LABEL_DYNAMIC_CSTR("WorkerThreadPrimaryRunnable::Run", OTHER,
                                    url.get());
 
+#if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
+  return STStartRun();
+#else
   using mozilla::ipc::BackgroundChild;
   {
     bool runLoopRan = false;
@@ -2422,6 +2443,7 @@ WorkerThreadPrimaryRunnable::Run() {
       mainTarget->Dispatch(finishedRunnable, NS_DISPATCH_NORMAL));
 
   return NS_OK;
+#endif  // __EMSCRIPTEN__ && !__EMSCRIPTEN_PTHREADS__
 }
 
 NS_IMETHODIMP
@@ -2435,6 +2457,125 @@ WorkerThreadPrimaryRunnable::FinishedRunnable::Run() {
 
   return NS_OK;
 }
+
+#if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
+nsresult WorkerThreadPrimaryRunnable::STStartRun() {
+  using mozilla::ipc::BackgroundChild;
+
+  mWorkerPrivate->SetWorkerPrivateInWorkerThread(mThread.unsafeGetRawPtr());
+  mWorkerPrivate->AssertIsOnWorkerThread();
+  mWorkerPrivate->EnsurePerformanceStorage();
+
+  auto failCleanup = [this]() {
+    mWorkerPrivate->RunLoopNeverRan();
+    mWorkerPrivate->ResetWorkerPrivateInWorkerThread();
+    mWorkerPrivate->ScheduleDeletion(WorkerPrivate::WorkerRan);
+  };
+
+  if (NS_WARN_IF(!BackgroundChild::GetOrCreateForCurrentThread())) {
+    failCleanup();
+    return NS_ERROR_FAILURE;
+  }
+
+  nsCycleCollector_startup();
+
+  mSTContext = MakeUnique<WorkerJSContext>(mWorkerPrivate);
+  nsresult rv = mSTContext->Initialize(mParentRuntime);
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    mSTContext = nullptr;
+    failCleanup();
+    return rv;
+  }
+
+  JSContext* cx = mSTContext->Context();
+
+  if (!InitJSContextForWorker(mWorkerPrivate, cx)) {
+    mSTContext = nullptr;
+    failCleanup();
+    return NS_ERROR_FAILURE;
+  }
+
+  PROFILER_SET_JS_CONTEXT(mSTContext.get());
+
+  // One-time run-loop setup (status -> Running, persistent AutoJSAPI, GC
+  // timers). Under ST this returns immediately instead of looping.
+  MOZ_KnownLive(mWorkerPrivate)->DoRunLoop(cx);
+
+  // Drive the loop cooperatively via a scheduler pump hook. Keep this runnable
+  // alive for the hook, and stop STPumpOne from also draining the worker
+  // vthread (the hook does it, wrapped in the worker's run-loop machinery).
+  mThread->STMarkHookDriven();
+  NS_ADDREF_THIS();
+  nsThreadManager::STAddPumpHook(&WorkerThreadPrimaryRunnable::STPumpHook, this);
+  return NS_OK;
+}
+
+/* static */
+bool WorkerThreadPrimaryRunnable::STPumpHook(void* aClosure) {
+  auto* self = static_cast<WorkerThreadPrimaryRunnable*>(aClosure);
+  bool didWork = false;
+  bool done = false;
+  {
+    mozilla::STAutoImpersonate imp(self->mThread.unsafeGetRawPtr());
+    done = self->mWorkerPrivate->DoRunLoopStepST(&didWork);
+    if (done) {
+      // Unregister BEFORE teardown: STFinish runs shutdown GC/CC which pumps
+      // the scheduler, and we must not re-enter this hook (double-finish).
+      nsThreadManager::STRemovePumpHook(&WorkerThreadPrimaryRunnable::STPumpHook,
+                                        self);
+      self->STFinish();
+    }
+  }
+  if (done) {
+    NS_RELEASE(self);
+    return true;
+  }
+  return didWork;
+}
+
+void WorkerThreadPrimaryRunnable::STFinish() {
+  using mozilla::ipc::BackgroundChild;
+  JSContext* cx = mSTContext->Context();
+
+  mWorkerPrivate->ShutdownModuleLoader();
+  mWorkerPrivate->RunShutdownTasks();
+  BackgroundChild::CloseForCurrentThread();
+  PROFILER_CLEAR_JS_CONTEXT();
+
+  mWorkerPrivate->ClearDebuggerEventQueue();
+  NS_ProcessPendingEvents(nullptr);
+
+  mWorkerPrivate->UnrootGlobalScopes();
+
+  // Full GC until the worker global is collected, breaking all JS cycles.
+  bool repeatGCCC = true;
+  while (repeatGCCC) {
+    JS::PrepareForFullGC(cx);
+    JS::NonIncrementalGC(cx, JS::GCOptions::Shutdown,
+                         JS::GCReason::WORKER_SHUTDOWN);
+    repeatGCCC = mWorkerPrivate->isLastCCCollectedAnything() ||
+                 NS_HasPendingEvents(nullptr);
+    NS_ProcessPendingEvents(nullptr);
+  }
+
+  nsCycleCollector_shutdown();
+  NS_ProcessPendingEvents(nullptr);
+
+  // Destroy the WorkerJSContext (cx is invalid after this).
+  mSTContext = nullptr;
+
+  mWorkerPrivate->ResetWorkerPrivateInWorkerThread();
+  mWorkerPrivate->ScheduleDeletion(WorkerPrivate::WorkerRan);
+  mWorkerPrivate = nullptr;
+
+  nsCOMPtr<nsIEventTarget> mainTarget = GetMainThreadSerialEventTarget();
+  MOZ_ASSERT(mainTarget);
+  RefPtr<FinishedRunnable> finishedRunnable =
+      new FinishedRunnable(std::move(mThread));
+  MOZ_ALWAYS_SUCCEEDS(
+      mainTarget->Dispatch(finishedRunnable, NS_DISPATCH_NORMAL));
+}
+#endif  // __EMSCRIPTEN__ && !__EMSCRIPTEN_PTHREADS__
 
 }  // namespace workerinternals
 

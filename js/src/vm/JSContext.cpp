@@ -80,6 +80,18 @@ JSContext* js::MaybeGetJSContext() {
 }
 #endif
 
+#if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
+// Single-threaded wasm: virtual threads (workers) share the one real thread's
+// js::TlsContext slot, so the ST scheduler must swap the "current JSContext"
+// when it impersonates a different virtual thread. These accessors let
+// nsThreadManager's STAutoImpersonate save/restore it without pulling JS
+// headers into xpcom.
+extern "C" void* gecko_st_get_tlscx() { return js::TlsContext.get(); }
+extern "C" void gecko_st_set_tlscx(void* aCx) {
+  js::TlsContext.set(reinterpret_cast<JSContext*>(aCx));
+}
+#endif
+
 bool js::AutoCycleDetector::init() {
   MOZ_ASSERT(cyclic);
 

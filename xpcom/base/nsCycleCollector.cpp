@@ -4209,6 +4209,17 @@ void nsCycleCollector_startup() {
   sCollectorData.set(data);
 }
 
+#if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
+// Single-threaded wasm: sCollectorData is per-REAL-thread TLS shared by all
+// virtual threads. Like js::TlsContext, the ST scheduler swaps it when
+// impersonating a DOM-worker vthread so each worker gets its own cycle
+// collector + registered JSContext. See nsThreadManager::STAutoImpersonate.
+extern "C" void* gecko_st_get_ccdata() { return sCollectorData.get(); }
+extern "C" void gecko_st_set_ccdata(void* aData) {
+  sCollectorData.set(reinterpret_cast<CollectorData*>(aData));
+}
+#endif
+
 void nsCycleCollector_setBeforeUnlinkCallback(CC_BeforeUnlinkCallback aCB) {
   CollectorData* data = sCollectorData.get();
 
