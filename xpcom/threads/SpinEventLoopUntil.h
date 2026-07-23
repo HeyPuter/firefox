@@ -34,6 +34,11 @@ class nsIThread;
 // If you *do* need to call NS_ProcessNextEvent manually, please do call
 // NS_GetCurrentThread() outside of your loop and pass the returned pointer
 // into NS_ProcessNextEvent for a tiny efficiency win.
+#if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
+// Single-threaded wasm virtual-thread scheduler pump (nsThreadManager.cpp).
+extern "C" bool gecko_st_pump(void);
+#endif
+
 namespace mozilla {
 
 // You should normally not need to deal with this template parameter.  If
@@ -178,6 +183,13 @@ bool SpinEventLoopUntil(const nsACString& aVeryGoodReasonToDoThis,
 #endif
   while (!aPredicate()) {
 #if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
+    // Single-threaded wasm: drain the virtual-thread scheduler every iteration.
+    // NS_ProcessNextEvent only pumps virtual threads via the condvar-wait hook
+    // when the main queue goes empty; a spin whose main queue stays busy (e.g.
+    // Add-on Manager startup) would otherwise never service background threads
+    // (IOUtils file I/O, etc.), so the async op the predicate awaits -- which
+    // runs on one of those threads -- could never complete. Pump them here.
+    gecko_st_pump();
     if ((++stSpins & 0xFFFFF) == 0) {
       printf("SpinEventLoopUntil[ST]: %llu spins in '%s'\n",
              (unsigned long long)stSpins,

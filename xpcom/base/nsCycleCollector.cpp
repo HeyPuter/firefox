@@ -4190,7 +4190,15 @@ bool nsCycleCollector_init() {
 
 void nsCycleCollector_startup() {
   if (sCollectorData.get()) {
+#if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
+    // Single-threaded wasm: sCollectorData is per-REAL-thread TLS, but virtual
+    // threads share the one real thread's TLS. A virtual thread starting its
+    // cycle collector finds the main thread's already set -- reuse it (one real
+    // thread => one collector) instead of crashing.
+    return;
+#else
     MOZ_CRASH();
+#endif
   }
 
   CollectorData* data = new CollectorData;
@@ -4343,6 +4351,14 @@ void nsCycleCollector_finishAnyCurrentCollection() {
 }
 
 void nsCycleCollector_shutdown(bool aDoCollect) {
+#if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
+  // Single-threaded wasm: the collector is shared across virtual threads (see
+  // nsCycleCollector_startup). Only the real main thread's shutdown may tear it
+  // down; a virtual thread's shutdown must leave it intact for the others.
+  if (!NS_IsMainThread()) {
+    return;
+  }
+#endif
   CollectorData* data = sCollectorData.get();
 
   if (data) {

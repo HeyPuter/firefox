@@ -223,6 +223,8 @@ function awaitPromise(promise) {
   let success = undefined;
   let result = null;
 
+  try { console.error("[ST-DIAG] awaitPromise from:\n" + new Error().stack); } catch (e) {}
+
   promise.then(
     val => {
       success = true;

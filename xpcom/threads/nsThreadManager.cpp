@@ -386,7 +386,11 @@ bool nsThreadManager::STPump() {
     return false;
   }
   STSchedState& st = *sSTState;
-  if (st.mDepth >= 8) {
+  if (st.mDepth >= 64) {
+    static uint64_t sCapHits = 0;
+    if ((sCapHits++ % 1000000ULL) == 0) {
+      printf("STPump[DIAG]: depth cap hit (depth=%u)\n", st.mDepth);
+    }
     return false;
   }
   st.mDepth++;
@@ -397,8 +401,26 @@ bool nsThreadManager::STPump() {
   }
   // Copy: threads can register/unregister while being pumped.
   nsTArray<RefPtr<nsThread>> threads = st.mThreads.Clone();
+  static uint64_t sDiagCounter = 0;
+  bool diag = (++sDiagCounter % 2000000ULL) == 1;
   for (auto& thread : threads) {
-    did |= thread->STPumpOne();
+    bool one = thread->STPumpOne();
+    if (diag && one) {
+      nsAutoCString nm;
+      thread->GetThreadName(nm);
+      printf("STPump[DIAG]: ran work on vthread '%s'\n", nm.get());
+    }
+    did |= one;
+  }
+  if (diag) {
+    nsAutoCString names;
+    for (auto& t : threads) {
+      nsAutoCString nm;
+      t->GetThreadName(nm);
+      names.Append(nm);
+      names.Append(' ');
+    }
+    printf("STPump[DIAG]: %zu vthreads: %s\n", threads.Length(), names.get());
   }
   if (!did) {
     // Nothing else moved: the wait we were called from can only be satisfied

@@ -411,6 +411,10 @@ class TaskController {
   void ShutdownThreadPoolInternal();
 
   void RunPoolThread(PoolThread* aThread);
+#if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
+  // Single-threaded wasm: run OffMainThreadOnly tasks inline on the main thread.
+  bool STRunThreadableTasks(const MutexAutoLock& aProofOfLock);
+#endif
   friend struct PoolThread;
 
   // This protects access to the task graph.

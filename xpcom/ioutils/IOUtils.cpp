@@ -2582,10 +2582,14 @@ RefPtr<IOUtils::IOPromise<OkT>> IOUtils::EventQueue::Dispatch(Fn aFunc) {
 
   auto promise =
       MakeRefPtr<typename IOUtils::IOPromise<OkT>::Private>(__func__);
+  printf("[IOUtils-DIAG] EventQueue::Dispatch (submit)\n");
   mBackgroundEventTarget->Dispatch(
       NS_NewRunnableFunction("IOUtils::EventQueue::Dispatch",
                              [promise, func = std::move(aFunc)] {
+                               printf("[IOUtils-DIAG] func() begin\n");
                                Result<OkT, IOError> result = func();
+                               printf("[IOUtils-DIAG] func() end isErr=%d\n",
+                                      (int)result.isErr());
                                if (result.isErr()) {
                                  promise->Reject(result.unwrapErr(), __func__);
                                } else {

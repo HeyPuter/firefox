@@ -53,6 +53,11 @@ struct PoolThread {
 
 /* static */
 int32_t TaskController::GetPoolThreadCount() {
+#if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
+  // Single-threaded wasm: no pool threads (raw PR_CreateThread would fail).
+  // OffMainThreadOnly tasks run on the main thread via STRunThreadableTasks.
+  return 0;
+#endif
   if (PR_GetEnv("MOZ_TASKCONTROLLER_THREADCOUNT")) {
     return strtol(PR_GetEnv("MOZ_TASKCONTROLLER_THREADCOUNT"), nullptr, 0);
   }
@@ -422,6 +427,43 @@ void TaskController::ShutdownThreadPoolInternal() {
 
   MOZ_ASSERT(mIdleThreadCount == mPoolThreads.size());
 }
+
+#if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
+// Single-threaded wasm: run all runnable OffMainThreadOnly tasks inline on the
+// sole thread (there are no pool threads). Mirrors RunPoolThread's completion
+// bookkeeping. Called from the main-thread task loop. Returns true if any ran.
+bool TaskController::STRunThreadableTasks(const MutexAutoLock& aProofOfLock) {
+  bool ranAny = false;
+  while (!mThreadableTasks.empty()) {
+    auto [task, effectivePriority] = TakeThreadableTaskToRun(aProofOfLock);
+    if (!task) {
+      break;
+    }
+    task->mInProgress = true;
+    bool completed = false;
+    {
+      MutexAutoUnlock unlock(mGraphMutex);
+      completed = RunTask(task) == Task::TaskResult::Complete;
+    }
+    task->mInProgress = false;
+    ranAny = true;
+    if (!completed) {
+      auto insertion = mThreadableTasks.insert(task);
+      task->mIterator = insertion.first;
+      break;  // interrupted / not ready; avoid busy-looping this tick
+    }
+    task->mCompleted = true;
+#ifdef DEBUG
+    task->mIsInGraph = false;
+#endif
+    task->mDependencies.clear();
+    mMayHaveMainThreadTask = true;
+    EnsureMainThreadTasksScheduled();
+    MaybeInterruptTask(GetHighestPriorityMTTask(), aProofOfLock);
+  }
+  return ranAny;
+}
+#endif
 
 void TaskController::RunPoolThread(PoolThread* aThread) {
   IOInterposer::RegisterCurrentThread();
@@ -1248,6 +1290,13 @@ bool TaskController::DoExecuteNextTaskOnlyMainThreadInternal(
     const MutexAutoLock& aProofOfLock) MOZ_REQUIRES(mGraphMutex) {
   mGraphMutex.AssertCurrentThreadOwns();
 
+#if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
+  // Single-threaded wasm: drain OffMainThreadOnly tasks here (no pool threads).
+  if (STRunThreadableTasks(aProofOfLock)) {
+    return true;
+  }
+#endif
+
   nsCOMPtr<nsIThread> mainIThread;
   NS_GetMainThread(getter_AddRefs(mainIThread));
 
@@ -1468,6 +1517,14 @@ void TaskController::MaybeInterruptTask(Task* aTask,
       mCurrentTasksMT.top()->RequestInterrupt(aTask->GetPriority());
     }
   } else {
+#if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
+    // Single-threaded wasm: no pool threads to interrupt. OffMainThreadOnly
+    // tasks are drained by STRunThreadableTasks on the main-thread loop, so
+    // just make sure that loop is scheduled to run.
+    mMayHaveMainThreadTask = true;
+    EnsureMainThreadTasksScheduled();
+    return;
+#endif
     if (mIdleThreadCount != 0) {
       DispatchThreadableTasks(aProofOfLock);
 
