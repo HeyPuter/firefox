@@ -1412,7 +1412,15 @@ bool nsSocketTransportService::STPollOnce() {
   if (!mInitialized || mShuttingDown || mSTPollPending) {
     return false;
   }
-  if (mActiveList.IsEmpty() && mIdleList.IsEmpty()) {
+  bool havePriority = false;
+  if (StaticPrefs::network_socket_prioritize_runnables()) {
+    AutoReadLock lock(mQueueLock);
+    havePriority = !mPriorityEventQueue.IsEmpty();
+  }
+  // Poll if there are sockets to service OR prioritized runnables queued (the
+  // latter includes DNS OnLookupComplete, dispatched before any socket is
+  // active -- without this the connect that the callback triggers never runs).
+  if (mActiveList.IsEmpty() && mIdleList.IsEmpty() && !havePriority) {
     return false;
   }
   // Rate-limit so an idle pump can detect "no progress" and yield rather
@@ -1438,6 +1446,21 @@ void nsSocketTransportService::STDoPoll() {
     return;
   }
   DoPollIteration();
+  // Drain the high-priority queue, which STS::Dispatch fills for prioritized
+  // runnables (e.g. DNS OnLookupComplete). In the threaded build Run() drains
+  // it right after each DoPollIteration; here the pump must do the same or
+  // those callbacks (and thus the connect that follows them) never run.
+  if (StaticPrefs::network_socket_prioritize_runnables()) {
+    Queue<RefPtr<nsIRunnable>> queue;
+    {
+      AutoWriteLock lock(mQueueLock);
+      queue = std::move(mPriorityEventQueue);
+    }
+    while (!queue.IsEmpty()) {
+      RefPtr<nsIRunnable> event = queue.Pop();
+      event->Run();
+    }
+  }
 }
 #endif
 

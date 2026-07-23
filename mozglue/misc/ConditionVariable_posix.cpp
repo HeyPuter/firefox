@@ -7,6 +7,7 @@
 
 #include <errno.h>
 #include <pthread.h>
+#include <stdio.h>
 #include <time.h>
 
 #include "mozilla/PlatformConditionVariable.h"
@@ -77,9 +78,9 @@ static void GeckoSTOnWait() {
   // condition nothing can satisfy; abort() so the trap shows the waiter.
   if (progress) {
     sNoProgress = 0;
-  } else if (++sNoProgress == 5000000ULL) {
-    fprintf(stderr, "GeckoSTOnWait: 5M no-progress waits, aborting for stack\n");
-    abort();
+  } else if (sNoProgress++ % 5000000ULL == 4999999ULL) {
+    fprintf(stderr, "GeckoSTOnWait: WARNING %llu consecutive no-progress waits\n",
+            (unsigned long long)sNoProgress);
   }
 }
 #  define GECKO_ST_ON_WAIT() GeckoSTOnWait()

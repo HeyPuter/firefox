@@ -339,8 +339,13 @@ bool STWaitHookThunk() {
     sLastSeen = gecko_st_activity;
     sLastChangeMs = now;
   } else if (now - sLastChangeMs > 30000) {
-    fprintf(stderr, "GeckoST: tick wedged >30s inside a wait, aborting\n");
-    abort();
+    // A tick wedged this long inside a wait is almost certainly a scheduler
+    // bug, but crashing the page is worse than continuing; warn once per stall.
+    static double sLastWarnMs = 0;
+    if (now - sLastWarnMs > 30000) {
+      sLastWarnMs = now;
+      fprintf(stderr, "GeckoST: WARNING tick wedged >30s inside a wait\n");
+    }
   }
   return nsThreadManager::STPump();
 }

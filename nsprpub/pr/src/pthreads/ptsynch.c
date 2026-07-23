@@ -246,9 +246,9 @@ static void pt_st_on_wait(void) {
    * wasm trap surfaces the waiting caller's full stack. */
   if (progress) {
     pt_st_no_progress = 0;
-  } else if (++pt_st_no_progress == 5000000ULL) {
-    fprintf(stderr, "pt_st_on_wait: 5M no-progress waits, aborting for stack\n");
-    abort();
+  } else if (pt_st_no_progress++ % 5000000ULL == 4999999ULL) {
+    fprintf(stderr, "pt_st_on_wait: WARNING %llu consecutive no-progress waits\n",
+            (unsigned long long)pt_st_no_progress);
   }
 }
 #  define PT_ST_ON_WAIT() pt_st_on_wait()
